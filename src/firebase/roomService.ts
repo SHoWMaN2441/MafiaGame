@@ -40,6 +40,81 @@ export function computeEndsAtMs(durationSec: number) {
   return Date.now() + durationSec * 1000;
 }
 
+// ---------- EVENTS (LOG) ----------
+export async function addEvent(params: {
+  roomId: string;
+  type: string;
+  text: string;
+  phase?: string | null;
+  dayNumber?: number | null;
+}) {
+  const { roomId, type, text, phase, dayNumber } = params;
+
+  await addDoc(collection(db, "rooms", roomId, "events"), {
+    type,
+    text,
+    phase: phase ?? null,
+    dayNumber: dayNumber ?? null,
+    createdAt: serverTimestamp(),
+    createdAtMs: Date.now(),
+  });
+}
+
+export function listenEvents(roomId: string, cb: (events: any[]) => void): Unsubscribe {
+  const q = query(collection(db, "rooms", roomId, "events"), orderBy("createdAt", "asc"));
+  return onSnapshot(q, (snap) => {
+    cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+  });
+}
+
+// ---------- CHAT ----------
+export async function sendMessage(params: {
+  roomId: string;
+  senderId: string;
+  senderNick: string;
+  text: string;
+  scope: "lobby" | "public" | "mafia";
+}) {
+  const { roomId, senderId, senderNick, text, scope } = params;
+
+  const clean = text.trim();
+  if (!clean) return;
+
+  await addDoc(collection(db, "rooms", roomId, "messages"), {
+    senderId,
+    senderNick,
+    text: clean.slice(0, 300),
+    scope,
+    createdAt: serverTimestamp(),
+    createdAtMs: Date.now(),
+  });
+}
+
+export function listenMessages(roomId: string, cb: (msgs: any[]) => void): Unsubscribe {
+  const q = query(collection(db, "rooms", roomId, "messages"), orderBy("createdAt", "asc"));
+  return onSnapshot(q, (snap) => {
+    cb(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+  });
+}
+
+// ---------- HOST SETTINGS ----------
+export async function updateRoomSettings(
+  roomId: string,
+  settings: Partial<{ nightSec: number; daySec: number; voteSec: number }>
+) {
+  const roomRef = doc(db, "rooms", roomId);
+  const snap = await getDoc(roomRef);
+  const prev = snap.exists() ? ((snap.data() as any).settings || {}) : {};
+
+  await updateDoc(roomRef, {
+    settings: {
+      ...prev,
+      ...settings,
+      updatedAt: serverTimestamp(),
+    },
+  });
+}
+
 // ---------- PLAYER CONNECTION ----------
 export async function setPlayerConnection(roomId: string, playerId: string, isConnected: boolean) {
   await updateDoc(doc(db, "rooms", roomId, "players", playerId), {
@@ -64,8 +139,6 @@ export async function ensurePlayerExists(roomId: string, playerId: string) {
 }
 
 // ✅ AUTO REJOIN (reconnect)
-// Agar localStorage'da playerId bor-u, doc yo‘q bo‘lsa -> qayta join qilib yangi player yaratadi.
-// nickname/avatar ni localStorage’dan oladi (agar bor bo‘lsa).
 export async function autoRejoinIfNeeded(params: {
   roomId: string;
   code: string;
@@ -83,7 +156,6 @@ export async function autoRejoinIfNeeded(params: {
     return { playerId: storedPlayerId, didRejoin: false };
   }
 
-  // doc topilmadi -> qayta join
   const nick = localStorage.getItem(`nickname_${code}`) || nicknameFallback;
   const avatar = localStorage.getItem(`avatar_${code}`) || avatarFallback;
 
@@ -95,6 +167,8 @@ export async function autoRejoinIfNeeded(params: {
     role: "unknown",
     isConnected: true,
     isKicked: false,
+    nightSubmitted: false,
+    voteSubmitted: false,
     lastSeenAtMs: Date.now(),
     createdAt: serverTimestamp(),
   });
@@ -134,6 +208,8 @@ export async function createRoom(nickname: string) {
     role: "unknown",
     isConnected: true,
     isKicked: false,
+    nightSubmitted: false,
+    voteSubmitted: false,
     lastSeenAtMs: Date.now(),
     createdAt: serverTimestamp(),
   });
@@ -146,6 +222,14 @@ export async function createRoom(nickname: string) {
   localStorage.setItem(`roomId_${code}`, roomRef.id);
   localStorage.setItem(`nickname_${code}`, nickname);
   localStorage.setItem(`avatar_${code}`, "avatar_1");
+
+  await addEvent({
+    roomId: roomRef.id,
+    type: "room_created",
+    text: `Room created by ${nickname}`,
+    phase: "lobby",
+    dayNumber: 0,
+  });
 
   return { roomId: roomRef.id, code };
 }
@@ -171,6 +255,8 @@ export async function joinRoom(roomId: string, code: string, nickname: string) {
     role: "unknown",
     isConnected: true,
     isKicked: false,
+    nightSubmitted: false,
+    voteSubmitted: false,
     lastSeenAtMs: Date.now(),
     createdAt: serverTimestamp(),
   });
@@ -179,6 +265,13 @@ export async function joinRoom(roomId: string, code: string, nickname: string) {
   localStorage.setItem(`roomId_${code}`, roomId);
   localStorage.setItem(`nickname_${code}`, nickname);
   localStorage.setItem(`avatar_${code}`, "avatar_1");
+
+  await addEvent({
+    roomId,
+    type: "player_joined",
+    text: `${nickname} joined`,
+    phase: "lobby",
+  });
 }
 
 // ------- REALTIME LISTENERS -------
@@ -196,34 +289,43 @@ export function listenPlayers(roomId: string, cb: (players: any[]) => void): Uns
   });
 }
 
-
 // ------- UPDATE PLAYER (READY/AVATAR) -------
 export async function updatePlayer(
   roomId: string,
   playerId: string,
   data: Partial<{ avatar: string; isReady: boolean }>
 ) {
-  // avatar localStorage ham yangilansin (reconnect uchun)
-  if (data.avatar) {
-    // room code bizda yo‘q, shuning uchun Room.tsx’dan saqlaymiz
-  }
   await updateDoc(doc(db, "rooms", roomId, "players", playerId), data);
 }
 
-// ✅ Host kick (faqat host chaqiradi)
+// ✅ Host kick
 export async function kickPlayer(roomId: string, targetPlayerId: string) {
   await updateDoc(doc(db, "rooms", roomId, "players", targetPlayerId), {
     isKicked: true,
     isConnected: false,
     kickedAt: serverTimestamp(),
   });
+
+  await addEvent({
+    roomId,
+    type: "player_kicked",
+    text: `Player kicked`,
+    phase: "lobby",
+  });
 }
 
-// ✅ Host remove (lobbyda “soft delete”: player chiqib ketgan kabi)
+// ✅ Host remove
 export async function removePlayer(roomId: string, targetPlayerId: string) {
   await updateDoc(doc(db, "rooms", roomId, "players", targetPlayerId), {
     isConnected: false,
     leftAt: serverTimestamp(),
+  });
+
+  await addEvent({
+    roomId,
+    type: "player_removed",
+    text: `Player removed`,
+    phase: "lobby",
   });
 }
 
@@ -278,6 +380,9 @@ export async function startGame(roomId: string, nightDurationSec?: number) {
       isAlive: true,
       isReady: false,
       isKicked: false,
+      nightSubmitted: false,
+      voteSubmitted: false,
+      private: {}, // komissar natija shu yerga tushadi
     });
   });
 
@@ -331,7 +436,6 @@ export async function submitNightAction(params: {
       "night.updatedAt": serverTimestamp(),
     });
   }
-
 
   if (role === "doctor") {
     await updateDoc(roomRef, {
@@ -463,7 +567,6 @@ export async function startVote(roomId: string, voteDurationSec?: number) {
   ps.docs.forEach((d) => {
     batch.update(doc(db, "rooms", roomId, "players", d.id), { voteSubmitted: false });
   });
-
 
   batch.update(roomRef, {
     phase: "vote",

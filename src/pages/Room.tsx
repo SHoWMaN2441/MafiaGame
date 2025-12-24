@@ -14,6 +14,10 @@ import {
   setPlayerConnection,
   heartbeat,
   ensurePlayerExists,
+  listenMessages,
+  sendMessage,
+  listenEvents,
+  updateRoomSettings,
 } from "../firebase/roomService";
 import { avatars } from "../data/avatars";
 
@@ -22,6 +26,10 @@ function formatSec(sec: number) {
   const m = Math.floor(s / 60);
   const r = s % 60;
   return `${m}:${r.toString().padStart(2, "0")}`;
+}
+
+function isMafiaRole(role: string) {
+  return role === "mafia" || role === "don";
 }
 
 export default function Room() {
@@ -36,9 +44,21 @@ export default function Room() {
   const [targetId, setTargetId] = useState<string>("");
   const [nowMs, setNowMs] = useState<number>(Date.now());
 
-  const NIGHT_SEC = 60;
-  const DAY_SEC = 60;
-  const VOTE_SEC = 45;
+  // host settings (UI)
+  const [nightSecInput, setNightSecInput] = useState<number>(60);
+  const [daySecInput, setDaySecInput] = useState<number>(60);
+  const [voteSecInput, setVoteSecInput] = useState<number>(45);
+
+  // chat + events
+  const [msgs, setMsgs] = useState<any[]>([]);
+  const [events, setEvents] = useState<any[]>([]);
+  const [chatText, setChatText] = useState("");
+  const [chatScope, setChatScope] = useState<"lobby" | "public" | "mafia">("lobby");
+
+  // durations used by host auto-advance (read from room.settings if exists)
+  const NIGHT_SEC = room?.settings?.nightSec ?? 60;
+  const DAY_SEC = room?.settings?.daySec ?? 60;
+  const VOTE_SEC = room?.settings?.voteSec ?? 45;
 
   const autoLockRef = useRef<string>("");
 
@@ -70,7 +90,18 @@ export default function Room() {
 
       setRoomId(r.roomId);
 
-      unsubRoom = listenRoomById(r.roomId, (data) => setRoom(data));
+      unsubRoom = listenRoomById(r.roomId, (data) => {
+        setRoom(data);
+
+        // settings input init (1 marta)
+        const s = data?.settings;
+        if (s) {
+          setNightSecInput(Number(s.nightSec ?? 60));
+          setDaySecInput(Number(s.daySec ?? 60));
+          setVoteSecInput(Number(s.voteSec ?? 45));
+        }
+      });
+
       unsubPlayers = listenPlayers(r.roomId, (p) => {
         setPlayers(p);
         setLoading(false);
@@ -82,6 +113,19 @@ export default function Room() {
       if (unsubRoom) unsubRoom();
     };
   }, [code, nav]);
+
+  // listen chat + events
+  useEffect(() => {
+    if (!roomId) return;
+
+    const u1 = listenMessages(roomId, setMsgs);
+    const u2 = listenEvents(roomId, setEvents);
+
+    return () => {
+      u1?.();
+      u2?.();
+    };
+  }, [roomId]);
 
   const me = useMemo(() => {
     if (!playerId) return null;
@@ -100,8 +144,8 @@ export default function Room() {
 
   const alivePlayers = useMemo(() => players.filter((p) => p.isAlive), [players]);
 
-  const myRole = me?.role as any;
-  const isMafiaRole = myRole === "mafia" || myRole === "don";
+  const myRole = (me?.role as any) ?? "unknown";
+  const isMafiaPlayer = myRole === "mafia" || myRole === "don";
   const isDoctor = myRole === "doctor";
   const isKomissar = myRole === "komissar";
 
@@ -123,7 +167,7 @@ export default function Room() {
     (async () => {
       const ok = await ensurePlayerExists(roomId, playerId);
       if (!ok) {
-        alert("Player topilmadi (localStorage o‘chgan bo‘lishi mumkin). Home’dan qayta kiring.");
+        alert("Player topilmadi. Home’dan qayta kiring.");
         nav("/");
         return;
       }
@@ -135,7 +179,6 @@ export default function Room() {
     }, 5000);
 
     const onUnload = () => {
-      // beforeunload ichida await bo‘lmaydi — lekin ko‘pincha update ulguradi
       setPlayerConnection(roomId, playerId, false).catch(() => {});
     };
 
@@ -148,7 +191,7 @@ export default function Room() {
     };
   }, [roomId, playerId, nav]);
 
-  // -------- TIMER AUTO ADVANCE (host) FIX --------
+  // -------- TIMER AUTO ADVANCE (host) --------
   useEffect(() => {
     if (!isHost) return;
     if (!roomId) return;
@@ -159,13 +202,11 @@ export default function Room() {
       if (!room.phaseEndsAtMs) return;
 
       const key = `${room.phase}-${room.phaseEndsAtMs}`;
-      // phase o‘zgargan bo‘lsa lock yangilanadi (va qayta ishlash mumkin bo‘ladi)
       if (autoLockRef.current === `done-${key}`) return;
 
       const expired = Date.now() >= Number(room.phaseEndsAtMs);
       if (!expired) return;
 
-      // shu phase-end uchun bitta marta ishlatamiz
       autoLockRef.current = `done-${key}`;
 
       try {
@@ -181,7 +222,6 @@ export default function Room() {
         }
       } catch (e) {
         console.log("auto-advance error:", e);
-        // agar error bo‘lsa yana urinishi uchun lockni bo‘shatib qo‘yamiz
         autoLockRef.current = "";
       }
     };
@@ -207,7 +247,7 @@ export default function Room() {
     if (!roomId) return;
     if (!allReady) return alert("Hamma READY bo‘lsin");
     try {
-      await startGame(roomId, NIGHT_SEC);
+      await startGame(roomId); // settings.nightSec ishlaydi
       setTargetId("");
       autoLockRef.current = "";
     } catch (e: any) {
@@ -218,9 +258,10 @@ export default function Room() {
   async function onSubmitNight() {
     if (!roomId || !me?.id) return;
     if (!targetId) return alert("Target tanlang");
+    if (me?.nightSubmitted) return alert("Siz actionni yuborgan siz ✅");
 
     const roleToSend =
-      isMafiaRole ? (myRole === "don" ? "don" : "mafia") : isDoctor ? "doctor" : "komissar";
+      isMafiaPlayer ? (myRole === "don" ? "don" : "mafia") : isDoctor ? "doctor" : "komissar";
 
     try {
       await submitNightAction({
@@ -238,6 +279,7 @@ export default function Room() {
   async function onSubmitVote() {
     if (!roomId || !me?.id) return;
     if (!targetId) return alert("Kimga ovoz berishni tanlang");
+    if (me?.voteSubmitted) return alert("Siz ovoz berib bo‘lgansiz ✅");
 
     try {
       await submitVote({
@@ -257,6 +299,23 @@ export default function Room() {
     nav("/");
   }
 
+  // private komissar result
+  const komissarBox = useMemo(() => {
+    if (!isKomissar) return null;
+    const res = me?.private?.lastCheckResult;
+    if (!res?.targetId) return null;
+
+    const name = players.find((p) => p.id === res.targetId)?.nickname || "Unknown";
+    return (
+      <div className="mt-3 bg-slate-900 border border-slate-700 rounded-xl p-3">
+        <p className="text-sm">
+          Tekshiruv natijasi: <span className="font-semibold">{name}</span> —{" "}
+          <span className="font-bold">{res.isMafia ? "MAFIA 😈" : "TINCH 🙂"}</span>
+        </p>
+      </div>
+    );
+  }, [isKomissar, me, players]);
+
   const killedName = useMemo(() => {
     const killedId = room?.night?.lastKilledPlayerId;
     if (!killedId) return "Hech kim o‘lmadi";
@@ -269,23 +328,7 @@ export default function Room() {
     return players.find((p) => p.id === id)?.nickname || "Unknown";
   }, [room, players]);
 
-  const checkBox = useMemo(() => {
-    if (!isKomissar) return null;
-    const res = room?.day?.lastCheckResult;
-    if (!res?.targetPlayerId) return null;
-
-    const name = players.find((p) => p.id === res.targetPlayerId)?.nickname || "Unknown";
-    return (
-      <div className="mt-3 bg-slate-900 border border-slate-700 rounded-xl p-3">
-        <p className="text-sm">
-          Tekshiruv natijasi: <span className="font-semibold">{name}</span> —{" "}
-          <span className="font-bold">{res.isMafia ? "MAFIA 😈" : "TINCH 🙂"}</span>
-        </p>
-      </div>
-    );
-  }, [isKomissar, room, players]);
-
-  // online indicator: isConnected true va lastSeenAtMs 12 sekund ichida bo‘lsa online
+  // online indicator
   const onlineSet = useMemo(() => {
     const s = new Set<string>();
     const now = Date.now();
@@ -297,9 +340,55 @@ export default function Room() {
     return s;
   }, [players, nowMs]);
 
+  // chat filtering: mafia scope only mafia/don sees
+  const visibleMsgs = useMemo(() => {
+    if (!room) return [];
+    const phase = room.status;
+
+    return msgs.filter((m) => {
+      if (m.scope === "mafia") return isMafiaPlayer;
+      if (m.scope === "lobby") return room?.status === "lobby" || room?.phase === "lobby";
+      return true; // public
+    });
+  }, [msgs, isMafiaPlayer, room]);
+
+  async function onSendChat() {
+    if (!roomId || !me?.id) return;
+    const scopeToSend =
+      chatScope === "mafia" && !isMafiaPlayer ? "public" : chatScope;
+
+    try {
+      await sendMessage({
+        roomId,
+        senderId: me.id,
+        senderNick: me.nickname || "Player",
+        text: chatText,
+        scope: scopeToSend,
+      });
+      setChatText("");
+    } catch (e: any) {
+      alert(e?.message || "Chat error");
+    }
+  }
+
+  async function onSaveSettings() {
+    if (!isHost || !roomId) return;
+
+    const n = Math.max(10, Math.min(300, Number(nightSecInput || 60)));
+    const d = Math.max(10, Math.min(300, Number(daySecInput || 60)));
+    const v = Math.max(10, Math.min(300, Number(voteSecInput || 45)));
+
+    try {
+      await updateRoomSettings(roomId, { nightSec: n, daySec: d, voteSec: v });
+      alert("Saved ✅");
+    } catch (e: any) {
+      alert(e?.message || "Save error");
+    }
+  }
+
   return (
     <div className="min-h-screen bg-slate-900 text-white p-4">
-      <div className="max-w-3xl mx-auto">
+      <div className="max-w-5xl mx-auto">
         <div className="flex items-center justify-between">
           <h2 className="text-2xl font-bold">Room Lobby / Game</h2>
           <div className="flex gap-2">
@@ -318,175 +407,10 @@ export default function Room() {
           </div>
         </div>
 
-        {/* TIMER BAR */}
-        {room?.status === "playing" && room?.phase !== "ended" && timeLeftSec !== null && (
-          <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4 flex items-center justify-between">
-            <div>
-              <p className="text-sm text-slate-300">Phase</p>
-              <p className="font-semibold text-lg">{room.phase.toUpperCase()}</p>
-            </div>
-            <div className="text-right">
-              <p className="text-sm text-slate-300">Time left</p>
-              <p className="font-bold text-2xl">{formatSec(timeLeftSec)}</p>
-              <p className="text-xs text-slate-400">
-                Timer: {isHost ? "HOST ✅" : "Host boshqaradi"}
-              </p>
-            </div>
-          </div>
-        )}
-
-        {/* GAME / WINNER */}
-        {room?.status === "ended" && (
-          <div className="mt-4 bg-amber-900/40 border border-amber-700 rounded-2xl p-4">
-            <p className="font-semibold text-lg">🏁 Game Ended</p>
-            <p className="text-slate-200 mt-1">
-              Winner:{" "}
-              <span className="font-bold">
-                {room.winner === "mafia" ? "MAFIA 😈" : "TOWN 🙂"}
-              </span>
-            </p>
-          </div>
-        )}
-
-        {room?.status === "playing" && (
-          <div className="mt-4 bg-purple-900/40 border border-purple-700 rounded-2xl p-4">
-            <p className="font-semibold">Game started 🎮</p>
-            <p className="text-sm text-slate-300">Phase: {room.phase}</p>
-            <p className="text-sm text-slate-300">
-              Sizning role: <span className="font-bold">{me?.role}</span>
-            </p>
-          </div>
-        )}
-
-        {/* NIGHT */}
-        {room?.status === "playing" && room?.phase === "night" && (
-          <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
-            <p className="font-semibold text-lg">🌙 Night Phase</p>
-
-            {(isMafiaRole || isDoctor || isKomissar) ? (
-              <>
-                <p className="mt-3 text-sm text-slate-300">
-                  {isMafiaRole && "Kimni o‘ldirmoqchisiz?"}
-                  {isDoctor && "Kimni saqlamoqchisiz?"}
-                  {isKomissar && "Kimni tekshirmoqchisiz?"}
-                </p>
-
-                <div className="mt-3 grid sm:grid-cols-2 gap-2">
-                  {alivePlayers
-                    .filter((p) => p.id !== me?.id)
-                    .map((p) => (
-                      <button
-                        key={p.id}
-                        onClick={() => setTargetId(p.id)}
-                        className={
-                          "p-3 rounded-2xl border text-left " +
-                          (targetId === p.id
-                            ? "bg-white text-slate-900 border-white"
-                            : "bg-slate-900 border-slate-700 hover:opacity-90")
-                        }
-                      >
-                        <p className="font-semibold flex items-center gap-2">
-                          {p.nickname}
-                          <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700">
-                            {onlineSet.has(p.id) ? "online" : "offline"}
-                          </span>
-                        </p>
-                        <p className="text-xs opacity-70">{p.avatar}</p>
-                      </button>
-                    ))}
-                </div>
-
-                <button
-                  onClick={onSubmitNight}
-                  className="mt-4 px-4 py-2 rounded-xl bg-emerald-500 text-slate-900 font-semibold"
-                >
-                  Submit Action
-                </button>
-              </>
-            ) : (
-              <p className="mt-3 text-slate-300">Siz kechasi action qilmaydigan roldasiz. Kuting...</p>
-            )}
-          </div>
-        )}
-
-        {/* DAY */}
-        {room?.status === "playing" && room?.phase === "day" && (
-          <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
-            <p className="font-semibold text-lg">☀️ Day Phase</p>
-            <p className="text-sm text-slate-300 mt-2">
-              Kechasi o‘lgan o‘yinchi: <span className="font-bold">{killedName}</span>
-            </p>
-            {checkBox}
-          </div>
-        )}
-
-        {/* VOTE */}
-        {room?.status === "playing" && room?.phase === "vote" && (
-          <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
-            <p className="font-semibold text-lg">🗳️ Vote Phase</p>
-
-            {!me?.isAlive ? (
-              <p className="mt-3 text-slate-300">Siz o‘lgansiz 💀. Ovoz bera olmaysiz.</p>
-            ) : (
-              <>
-                <p className="mt-3 text-sm text-slate-300">Kimni chiqarib yuborishga ovoz berasiz?</p>
-
-                <div className="mt-3 grid sm:grid-cols-2 gap-2">
-                  {alivePlayers
-                    .filter((p) => p.id !== me?.id)
-                    .map((p) => (
-                      <button
-                        key={p.id}
-                        onClick={() => setTargetId(p.id)}
-                        className={
-                          "p-3 rounded-2xl border text-left " +
-                          (targetId === p.id
-                            ? "bg-white text-slate-900 border-white"
-                            : "bg-slate-900 border-slate-700 hover:opacity-90")
-                        }
-                      >
-                        <p className="font-semibold flex items-center gap-2">
-                          {p.nickname}
-                          <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700">
-                            {onlineSet.has(p.id) ? "online" : "offline"}
-                          </span>
-                        </p>
-                        <p className="text-xs opacity-70">{p.avatar}</p>
-                      </button>
-                    ))}
-                </div>
-
-                <button
-                  onClick={onSubmitVote}
-                  className="mt-4 px-4 py-2 rounded-xl bg-emerald-500 text-slate-900 font-semibold"
-                >
-                  Submit Vote
-                </button>
-
-                <p className="mt-3 text-xs text-slate-400">
-                  Sizning hozirgi ovozingiz:{" "}
-                  <span className="font-semibold">
-                    {myVoteTarget ? (players.find((p) => p.id === myVoteTarget)?.nickname || "Unknown") : "yo‘q"}
-                  </span>
-                </p>
-              </>
-            )}
-          </div>
-        )}
-
-        {/* Vote result */}
-        {room?.status === "playing" && room?.vote?.resolved && room?.phase === "night" && (
-          <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
-            <p className="font-semibold">Vote Result</p>
-            <p className="text-sm text-slate-300 mt-2">
-              Chiqib ketgan o‘yinchi: <span className="font-bold">{eliminatedName}</span>
-            </p>
-          </div>
-        )}
-
-        {/* LOBBY / PLAYERS */}
-        <div className="mt-4 grid gap-4 md:grid-cols-3">
-          <div className="md:col-span-1 bg-slate-800 border border-slate-700 rounded-2xl p-4">
+        {/* TOP GRID */}
+        <div className="mt-4 grid gap-4 lg:grid-cols-3">
+          {/* LEFT: ROOM / ME / SETTINGS */}
+          <div className="bg-slate-800 border border-slate-700 rounded-2xl p-4">
             <p className="text-slate-300 text-sm">Room Code</p>
             <p className="text-3xl font-bold tracking-widest mt-1">{code}</p>
 
@@ -518,9 +442,19 @@ export default function Room() {
                     {me?.isReady ? "YES" : "NO"}
                   </span>
                 </p>
-                <p className="text-xs mt-2 text-slate-400">
-                  Siz: {isHost ? "HOST 👑" : "PLAYER"}
+                <p className="text-sm">
+                  Night:{" "}
+                  <span className={me?.nightSubmitted ? "text-emerald-400" : "text-slate-300"}>
+                    {me?.nightSubmitted ? "submitted ✅" : "not yet"}
+                  </span>
                 </p>
+                <p className="text-sm">
+                  Vote:{" "}
+                  <span className={me?.voteSubmitted ? "text-emerald-400" : "text-slate-300"}>
+                    {me?.voteSubmitted ? "submitted ✅" : "not yet"}
+                  </span>
+                </p>
+                <p className="text-xs mt-2 text-slate-400">Siz: {isHost ? "HOST 👑" : "PLAYER"}</p>
               </div>
 
               <button
@@ -541,9 +475,271 @@ export default function Room() {
                 </button>
               )}
             </div>
+
+            {/* HOST SETTINGS */}
+            {isHost && (
+              <div className="mt-5 bg-slate-900 border border-slate-700 rounded-2xl p-3">
+                <p className="font-semibold">Host Settings</p>
+                <p className="text-xs text-slate-400 mt-1">
+                  10–300 sec (o‘yinda keyingi timerlar shu bilan ishlaydi)
+                </p>
+
+                <div className="mt-3 grid grid-cols-3 gap-2">
+                  <div>
+                    <p className="text-xs text-slate-400">Night</p>
+                    <input
+                      value={nightSecInput}
+                      onChange={(e) => setNightSecInput(Number(e.target.value))}
+                      className="w-full mt-1 px-2 py-2 rounded-xl bg-slate-800 border border-slate-700"
+                      type="number"
+                      min={10}
+                      max={300}
+                    />
+                  </div>
+                  <div>
+                    <p className="text-xs text-slate-400">Day</p>
+                    <input
+                      value={daySecInput}
+                      onChange={(e) => setDaySecInput(Number(e.target.value))}
+                      className="w-full mt-1 px-2 py-2 rounded-xl bg-slate-800 border border-slate-700"
+                      type="number"
+                      min={10}
+                      max={300}
+                    />
+                  </div>
+                  <div>
+                    <p className="text-xs text-slate-400">Vote</p>
+                    <input
+                      value={voteSecInput}
+                      onChange={(e) => setVoteSecInput(Number(e.target.value))}
+                      className="w-full mt-1 px-2 py-2 rounded-xl bg-slate-800 border border-slate-700"
+                      type="number"
+                      min={10}
+                      max={300}
+                    />
+                  </div>
+                </div>
+
+                <button
+                  onClick={onSaveSettings}
+                  className="mt-3 w-full px-4 py-2 rounded-xl bg-white text-slate-900 font-semibold"
+                >
+                  Save Settings
+                </button>
+              </div>
+            )}
           </div>
 
-          <div className="md:col-span-2 bg-slate-800 border border-slate-700 rounded-2xl p-4">
+          {/* MIDDLE: TIMER + PHASE CONTENT */}
+          <div className="lg:col-span-2">
+            {/* TIMER BAR */}
+            {room?.status === "playing" && room?.phase !== "ended" && timeLeftSec !== null && (
+              <div className="bg-slate-800 border border-slate-700 rounded-2xl p-4 flex items-center justify-between">
+                <div>
+                  <p className="text-sm text-slate-300">Phase</p>
+                  <p className="font-semibold text-lg">{room.phase.toUpperCase()}</p>
+                  <p className="text-xs text-slate-400 mt-1">
+                    Night/Day/Vote: {NIGHT_SEC}/{DAY_SEC}/{VOTE_SEC} sec
+                  </p>
+                </div>
+                <div className="text-right">
+                  <p className="text-sm text-slate-300">Time left</p>
+                  <p className="font-bold text-2xl">{formatSec(timeLeftSec)}</p>
+                  <p className="text-xs text-slate-400">Timer: {isHost ? "HOST ✅" : "Host boshqaradi"}</p>
+                </div>
+              </div>
+            )}
+
+            {/* GAME / WINNER */}
+            {room?.status === "ended" && (
+              <div className="mt-4 bg-amber-900/40 border border-amber-700 rounded-2xl p-4">
+                <p className="font-semibold text-lg">🏁 Game Ended</p>
+                <p className="text-slate-200 mt-1">
+                  Winner:{" "}
+                  <span className="font-bold">{room.winner === "mafia" ? "MAFIA 😈" : "TOWN 🙂"}</span>
+                </p>
+              </div>
+            )}
+
+            {room?.status === "playing" && (
+              <div className="mt-4 bg-purple-900/40 border border-purple-700 rounded-2xl p-4">
+                <p className="font-semibold">Game started 🎮</p>
+                <p className="text-sm text-slate-300">Phase: {room.phase}</p>
+                <p className="text-sm text-slate-300">
+                  Sizning role: <span className="font-bold">{me?.role}</span>
+                </p>
+              </div>
+            )}
+
+            {/* NIGHT */}
+            {room?.status === "playing" && room?.phase === "night" && (
+              <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
+                <p className="font-semibold text-lg">🌙 Night Phase</p>
+
+                {(isMafiaPlayer || isDoctor || isKomissar) ? (
+                  <>
+                    <p className="mt-3 text-sm text-slate-300">
+                      {isMafiaPlayer && "Kimni o‘ldirmoqchisiz?"}
+                      {isDoctor && "Kimni saqlamoqchisiz?"}
+                      {isKomissar && "Kimni tekshirmoqchisiz?"}
+                    </p>
+
+                    <div className="mt-3 grid sm:grid-cols-2 gap-2">
+                      {alivePlayers
+                        .filter((p) => p.id !== me?.id)
+                        .map((p) => (
+                          <button
+                            key={p.id}
+                            onClick={() => setTargetId(p.id)}
+                            className={
+                              "p-3 rounded-2xl border text-left " +
+                              (targetId === p.id
+                                ? "bg-white text-slate-900 border-white"
+                                : "bg-slate-900 border-slate-700 hover:opacity-90")
+                            }
+                          >
+                            <p className="font-semibold flex items-center gap-2">
+                              {p.nickname}
+                              <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700">
+                                {onlineSet.has(p.id) ? "online" : "offline"}
+                              </span>
+
+                              {/* mafia/don sees teammates */}
+                              {isMafiaPlayer && isMafiaRole(p.role) && p.id !== me?.id && (
+                                <span className="text-xs px-2 py-0.5 rounded-full bg-red-500 text-slate-900">
+                                  teammate
+                                </span>
+                              )}
+                            </p>
+                            <p className="text-xs opacity-70">{p.avatar}</p>
+                          </button>
+                        ))}
+                    </div>
+
+                    <button
+                      onClick={onSubmitNight}
+                      disabled={!!me?.nightSubmitted}
+                      className="mt-4 px-4 py-2 rounded-xl bg-emerald-500 text-slate-900 font-semibold disabled:opacity-50"
+                    >
+                      {me?.nightSubmitted ? "Submitted ✅" : "Submit Action"}
+                    </button>
+                  </>
+                ) : (
+                  <p className="mt-3 text-slate-300">Siz kechasi action qilmaydigan roldasiz. Kuting...</p>
+                )}
+              </div>
+            )}
+
+            {/* DAY */}
+            {room?.status === "playing" && room?.phase === "day" && (
+              <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
+                <p className="font-semibold text-lg">☀️ Day Phase</p>
+                <p className="text-sm text-slate-300 mt-2">
+                  Kechasi o‘lgan o‘yinchi: <span className="font-bold">{killedName}</span>
+                </p>
+                {komissarBox}
+              </div>
+            )}
+
+            {/* VOTE */}
+            {room?.status === "playing" && room?.phase === "vote" && (
+              <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
+                <p className="font-semibold text-lg">🗳️ Vote Phase</p>
+
+                {!me?.isAlive ? (
+                  <p className="mt-3 text-slate-300">Siz o‘lgansiz 💀. Ovoz bera olmaysiz.</p>
+                ) : (
+                  <>
+                    <p className="mt-3 text-sm text-slate-300">Kimni chiqarib yuborishga ovoz berasiz?</p>
+
+                    <div className="mt-3 grid sm:grid-cols-2 gap-2">
+                      {alivePlayers
+                        .filter((p) => p.id !== me?.id)
+                        .map((p) => (
+                          <button
+                            key={p.id}
+                            onClick={() => setTargetId(p.id)}
+                            className={
+                              "p-3 rounded-2xl border text-left " +
+                              (targetId === p.id
+                                ? "bg-white text-slate-900 border-white"
+                                : "bg-slate-900 border-slate-700 hover:opacity-90")
+                            }
+                          >
+                            <p className="font-semibold flex items-center gap-2">
+                              {p.nickname}
+                              <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700">
+                                {onlineSet.has(p.id) ? "online" : "offline"}
+                              </span>
+                            </p>
+                            <p className="text-xs opacity-70">{p.avatar}</p>
+                          </button>
+                        ))}
+                    </div>
+
+                    <button
+                      onClick={onSubmitVote}
+                      disabled={!!me?.voteSubmitted}
+                      className="mt-4 px-4 py-2 rounded-xl bg-emerald-500 text-slate-900 font-semibold disabled:opacity-50"
+                    >
+                      {me?.voteSubmitted ? "Voted ✅" : "Submit Vote"}
+                    </button>
+
+                    <p className="mt-3 text-xs text-slate-400">
+                      Sizning hozirgi ovozingiz:{" "}
+                      <span className="font-semibold">
+                        {myVoteTarget
+                          ? players.find((p) => p.id === myVoteTarget)?.nickname || "Unknown"
+                          : "yo‘q"}
+                      </span>
+                      {"  "} (UI secret emas, lekin MVP uchun qoldirildi)
+                    </p>
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* Vote result */}
+            {room?.status === "playing" && room?.vote?.resolved && room?.phase === "night" && (
+              <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
+                <p className="font-semibold">Vote Result</p>
+                <p className="text-sm text-slate-300 mt-2">
+                  Chiqib ketgan o‘yinchi: <span className="font-bold">{eliminatedName}</span>
+                </p>
+              </div>
+            )}
+
+            {/* AVATAR */}
+            <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
+              <p className="font-semibold mb-2">Choose avatar</p>
+              <div className="flex flex-wrap gap-2">
+                {avatars.map((a) => (
+                  <button
+                    key={a}
+                    onClick={() => setAvatar(a)}
+                    disabled={room?.status === "playing" || room?.status === "ended"}
+                    className={
+                      "px-3 py-2 rounded-xl border text-sm disabled:opacity-50 " +
+                      (me?.avatar === a
+                        ? "bg-white text-slate-900 border-white"
+                        : "bg-slate-900 border-slate-700 hover:opacity-90")
+                    }
+                  >
+                    {a}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-slate-400 mt-2">
+                O‘yin boshlanganidan keyin avatar/ready o‘zgarmaydi (MVP).
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* BOTTOM GRID: PLAYERS + CHAT + EVENTS */}
+        <div className="mt-4 grid gap-4 lg:grid-cols-3">
+          {/* PLAYERS */}
+          <div className="lg:col-span-2 bg-slate-800 border border-slate-700 rounded-2xl p-4">
             <div className="flex items-center justify-between mb-3">
               <p className="font-semibold">Players</p>
               <span className="text-sm text-slate-300">{players.length} ta</span>
@@ -567,9 +763,17 @@ export default function Room() {
                         <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700">
                           {onlineSet.has(p.id) ? "online" : "offline"}
                         </span>
+
+                        {/* mafia teammates only */}
+                        {isMafiaPlayer && isMafiaRole(p.role) && p.id !== me?.id && (
+                          <span className="text-xs px-2 py-0.5 rounded-full bg-red-500 text-slate-900">
+                            teammate
+                          </span>
+                        )}
                       </p>
                       <p className="text-xs text-slate-400">{p.avatar}</p>
                     </div>
+
                     <span
                       className={
                         "text-xs px-3 py-1 rounded-full " +
@@ -582,29 +786,70 @@ export default function Room() {
                 ))}
               </div>
             )}
+          </div>
 
-            <div className="mt-6">
-              <p className="font-semibold mb-2">Choose avatar</p>
-              <div className="flex flex-wrap gap-2">
-                {avatars.map((a) => (
-                  <button
-                    key={a}
-                    onClick={() => setAvatar(a)}
-                    disabled={room?.status === "playing" || room?.status === "ended"}
-                    className={
-                      "px-3 py-2 rounded-xl border text-sm disabled:opacity-50 " +
-                      (me?.avatar === a
-                        ? "bg-white text-slate-900 border-white"
-                        : "bg-slate-900 border-slate-700 hover:opacity-90")
-                    }
-                  >
-                    {a}
-                  </button>
-                ))}
-              </div>
-              <p className="text-xs text-slate-400 mt-2">
-                O‘yin boshlanganidan keyin avatar/ready o‘zgarmaydi (MVP).
-              </p>
+          {/* CHAT + EVENTS */}
+          <div className="bg-slate-800 border border-slate-700 rounded-2xl p-4">
+            <p className="font-semibold">Chat</p>
+
+            <div className="mt-3 flex gap-2">
+              <select
+                value={chatScope}
+                onChange={(e) => setChatScope(e.target.value as any)}
+                className="px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-sm"
+              >
+                <option value="lobby">Lobby</option>
+                <option value="public">Public</option>
+                <option value="mafia" disabled={!isMafiaPlayer}>
+                  Mafia
+                </option>
+              </select>
+
+              <input
+                value={chatText}
+                onChange={(e) => setChatText(e.target.value)}
+                placeholder="Message..."
+                className="flex-1 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-sm"
+              />
+
+              <button
+                onClick={onSendChat}
+                className="px-4 py-2 rounded-xl bg-white text-slate-900 font-semibold"
+              >
+                Send
+              </button>
+            </div>
+
+            <div className="mt-3 h-56 overflow-y-auto bg-slate-900 border border-slate-700 rounded-2xl p-3 space-y-2">
+              {visibleMsgs.length === 0 ? (
+                <p className="text-sm text-slate-400">No messages</p>
+              ) : (
+                visibleMsgs.map((m) => (
+                  <div key={m.id} className="text-sm">
+                    <span className="text-slate-400">{m.senderNick}:</span>{" "}
+                    <span className="text-white">{m.text}</span>{" "}
+                    <span className="text-xs text-slate-500">[{m.scope}]</span>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <p className="font-semibold mt-5">Events</p>
+            <div className="mt-2 h-48 overflow-y-auto bg-slate-900 border border-slate-700 rounded-2xl p-3 space-y-2">
+              {events.length === 0 ? (
+                <p className="text-sm text-slate-400">No events</p>
+              ) : (
+                events
+                  .slice()
+                  .reverse()
+                  .slice(0, 30)
+                  .map((e) => (
+                    <div key={e.id} className="text-sm">
+                      <span className="text-slate-400">{e.type}</span>:{" "}
+                      <span className="text-white">{e.text}</span>
+                    </div>
+                  ))
+              )}
             </div>
           </div>
         </div>
