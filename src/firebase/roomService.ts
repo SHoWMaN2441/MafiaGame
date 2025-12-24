@@ -116,8 +116,14 @@ export async function createRoom(nickname: string) {
     dayNumber: 0,
     createdAt: serverTimestamp(),
     ownerNickname: nickname,
+    ownerPlayerId: null,
     phaseEndsAtMs: null,
     winner: null,
+    settings: {
+      nightSec: 60,
+      daySec: 60,
+      voteSec: 45,
+    },
   });
 
   const playerRef = await addDoc(collection(db, "rooms", roomRef.id, "players"), {
@@ -190,6 +196,7 @@ export function listenPlayers(roomId: string, cb: (players: any[]) => void): Uns
   });
 }
 
+
 // ------- UPDATE PLAYER (READY/AVATAR) -------
 export async function updatePlayer(
   roomId: string,
@@ -247,7 +254,13 @@ function buildRoles(count: number) {
   return shuffle(roles);
 }
 
-export async function startGame(roomId: string, nightDurationSec = 60) {
+export async function startGame(roomId: string, nightDurationSec?: number) {
+  const roomRef = doc(db, "rooms", roomId);
+  const roomSnap = await getDoc(roomRef);
+  const room = roomSnap.exists() ? (roomSnap.data() as any) : null;
+
+  const nightSec = nightDurationSec ?? room?.settings?.nightSec ?? 60;
+
   const q = query(collection(db, "rooms", roomId, "players"), orderBy("createdAt", "asc"));
   const snap = await getDocs(q);
   const players = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
@@ -268,7 +281,7 @@ export async function startGame(roomId: string, nightDurationSec = 60) {
     });
   });
 
-  batch.update(doc(db, "rooms", roomId), {
+  batch.update(roomRef, {
     status: "playing",
     phase: "night",
     dayNumber: 0,
@@ -277,13 +290,22 @@ export async function startGame(roomId: string, nightDurationSec = 60) {
     day: {},
     vote: {},
     winner: null,
-    phaseEndsAtMs: computeEndsAtMs(nightDurationSec),
+    phaseEndsAtMs: computeEndsAtMs(nightSec),
   });
 
   await batch.commit();
+
+  await addEvent({
+    roomId,
+    type: "game_started",
+    text: "Game started",
+    phase: "night",
+    dayNumber: 0,
+  });
 }
 
 // ------- NIGHT ACTIONS (SUBMIT) -------
+// ✅ 1 marta: player.nightSubmitted true bo‘lsa qayta yozmaymiz (MVP)
 export async function submitNightAction(params: {
   roomId: string;
   role: "mafia" | "don" | "doctor" | "komissar";
@@ -291,6 +313,14 @@ export async function submitNightAction(params: {
   targetPlayerId: string;
 }) {
   const { roomId, role, actorPlayerId, targetPlayerId } = params;
+
+  const actorRef = doc(db, "rooms", roomId, "players", actorPlayerId);
+  const actorSnap = await getDoc(actorRef);
+  if (!actorSnap.exists()) throw new Error("Actor topilmadi");
+
+  const actor = actorSnap.data() as any;
+  if (actor.nightSubmitted) throw new Error("Siz actionni yuborgan siz ✅");
+
   const roomRef = doc(db, "rooms", roomId);
 
   if (role === "mafia" || role === "don") {
@@ -301,6 +331,7 @@ export async function submitNightAction(params: {
       "night.updatedAt": serverTimestamp(),
     });
   }
+
 
   if (role === "doctor") {
     await updateDoc(roomRef, {
@@ -319,30 +350,44 @@ export async function submitNightAction(params: {
       "night.updatedAt": serverTimestamp(),
     });
   }
+
+  // lock
+  await updateDoc(actorRef, {
+    nightSubmitted: true,
+    nightSubmittedAtMs: Date.now(),
+  });
 }
 
 // ------- NIGHT RESOLVE (HOST) -------
-export async function resolveNight(roomId: string, dayDurationSec = 60) {
+export async function resolveNight(roomId: string, dayDurationSec?: number) {
   const roomRef = doc(db, "rooms", roomId);
   const roomSnap = await getDoc(roomRef);
   if (!roomSnap.exists()) throw new Error("Room topilmadi");
 
   const room = roomSnap.data() as any;
+  const daySec = dayDurationSec ?? room?.settings?.daySec ?? 60;
 
   const night = room.night || {};
   const killTargetId = night.killTargetId as string | undefined;
   const saveTargetId = night.saveTargetId as string | undefined;
   const checkTargetId = night.checkTargetId as string | undefined;
+  const checkBy = night.checkBy as string | undefined;
 
   const q = query(collection(db, "rooms", roomId, "players"), orderBy("createdAt", "asc"));
   const ps = await getDocs(q);
   const players = ps.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
 
-  let checkResult: null | { targetPlayerId: string; isMafia: boolean } = null;
-  if (checkTargetId) {
+  // ✅ komissar natijasi faqat komissarga yoziladi
+  if (checkTargetId && checkBy) {
     const target = players.find((p) => p.id === checkTargetId);
     if (target) {
-      checkResult = { targetPlayerId: checkTargetId, isMafia: isMafiaRole(target.role) };
+      await updateDoc(doc(db, "rooms", roomId, "players", checkBy), {
+        "private.lastCheckResult": {
+          targetId: checkTargetId,
+          isMafia: isMafiaRole(target.role),
+          at: Date.now(),
+        },
+      });
     }
   }
 
@@ -354,14 +399,15 @@ export async function resolveNight(roomId: string, dayDurationSec = 60) {
   const batch = writeBatch(db);
 
   if (killedPlayerId) {
-    batch.update(doc(db, "rooms", roomId, "players", killedPlayerId), {
-      isAlive: false,
-    });
+    batch.update(doc(db, "rooms", roomId, "players", killedPlayerId), { isAlive: false });
   }
 
-  const playersAfter = players.map((p) =>
-    p.id === killedPlayerId ? { ...p, isAlive: false } : p
-  );
+  // ✅ nightSubmitted reset (next night uchun)
+  players.forEach((p) => {
+    batch.update(doc(db, "rooms", roomId, "players", p.id), { nightSubmitted: false });
+  });
+
+  const playersAfter = players.map((p) => (p.id === killedPlayerId ? { ...p, isAlive: false } : p));
   const winner = calcWinner(playersAfter);
 
   if (winner) {
@@ -370,64 +416,110 @@ export async function resolveNight(roomId: string, dayDurationSec = 60) {
       winner,
       phase: "ended",
       phaseEndsAtMs: null,
-      "day.lastCheckResult": checkResult,
       night: {
         resolvedAt: serverTimestamp(),
         lastKilledPlayerId: killedPlayerId,
         lastSavedPlayerId: saveTargetId ?? null,
       },
+      day: {},
+      vote: {},
     });
   } else {
     batch.update(roomRef, {
       phase: "day",
-      phaseEndsAtMs: computeEndsAtMs(dayDurationSec),
+      phaseEndsAtMs: computeEndsAtMs(daySec),
       dayNumber: (room.dayNumber ?? 0) + 1,
-      "day.lastCheckResult": checkResult,
       night: {
         resolvedAt: serverTimestamp(),
         lastKilledPlayerId: killedPlayerId,
         lastSavedPlayerId: saveTargetId ?? null,
       },
+      day: {},
       vote: {},
     });
   }
 
   await batch.commit();
+
+  await addEvent({
+    roomId,
+    type: "night_resolved",
+    text: killedPlayerId ? `Night: 1 player died` : `Night: nobody died`,
+    phase: winner ? "ended" : "day",
+    dayNumber: winner ? room.dayNumber ?? 0 : (room.dayNumber ?? 0) + 1,
+  });
 }
 
 // ------- VOTE: START (HOST) -------
-export async function startVote(roomId: string, voteDurationSec = 45) {
-  await updateDoc(doc(db, "rooms", roomId), {
+export async function startVote(roomId: string, voteDurationSec?: number) {
+  const roomRef = doc(db, "rooms", roomId);
+  const snap = await getDoc(roomRef);
+  const room = snap.exists() ? (snap.data() as any) : null;
+  const voteSec = voteDurationSec ?? room?.settings?.voteSec ?? 45;
+
+  // voteSubmitted reset (vote boshida)
+  const ps = await getDocs(query(collection(db, "rooms", roomId, "players"), orderBy("createdAt", "asc")));
+  const batch = writeBatch(db);
+  ps.docs.forEach((d) => {
+    batch.update(doc(db, "rooms", roomId, "players", d.id), { voteSubmitted: false });
+  });
+
+
+  batch.update(roomRef, {
     phase: "vote",
-    phaseEndsAtMs: computeEndsAtMs(voteDurationSec),
+    phaseEndsAtMs: computeEndsAtMs(voteSec),
     vote: {
       startedAt: serverTimestamp(),
       votes: {},
       resolved: false,
     },
   });
+
+  await batch.commit();
+
+  await addEvent({
+    roomId,
+    type: "vote_started",
+    text: "Vote started",
+    phase: "vote",
+  });
 }
 
-// ------- VOTE: SUBMIT -------
+// ------- VOTE: SUBMIT (1 marta) -------
 export async function submitVote(params: {
   roomId: string;
   voterPlayerId: string;
   targetPlayerId: string;
 }) {
   const { roomId, voterPlayerId, targetPlayerId } = params;
+
+  const voterRef = doc(db, "rooms", roomId, "players", voterPlayerId);
+  const voterSnap = await getDoc(voterRef);
+  if (!voterSnap.exists()) throw new Error("Voter topilmadi");
+
+  const voter = voterSnap.data() as any;
+  if (voter.voteSubmitted) throw new Error("Siz ovoz berib bo‘lgansiz ✅");
+
   await updateDoc(doc(db, "rooms", roomId), {
     [`vote.votes.${voterPlayerId}`]: targetPlayerId,
     "vote.updatedAt": serverTimestamp(),
   });
+
+  await updateDoc(voterRef, {
+    voteSubmitted: true,
+    voteSubmittedAtMs: Date.now(),
+  });
 }
 
 // ------- VOTE: RESOLVE (HOST) -------
-export async function resolveVote(roomId: string, nightDurationSec = 60) {
+export async function resolveVote(roomId: string, nightDurationSec?: number) {
   const roomRef = doc(db, "rooms", roomId);
   const roomSnap = await getDoc(roomRef);
   if (!roomSnap.exists()) throw new Error("Room topilmadi");
 
   const room = roomSnap.data() as any;
+  const nightSec = nightDurationSec ?? room?.settings?.nightSec ?? 60;
+
   const votesObj = (room.vote?.votes || {}) as Record<string, string>;
 
   const q = query(collection(db, "rooms", roomId, "players"), orderBy("createdAt", "asc"));
@@ -465,9 +557,12 @@ export async function resolveVote(roomId: string, nightDurationSec = 60) {
     batch.update(doc(db, "rooms", roomId, "players", eliminatedId), { isAlive: false });
   }
 
-  const playersAfter = players.map((p) =>
-    p.id === eliminatedId ? { ...p, isAlive: false } : p
-  );
+  // voteSubmitted reset (keyingi vote uchun)
+  players.forEach((p) => {
+    batch.update(doc(db, "rooms", roomId, "players", p.id), { voteSubmitted: false });
+  });
+
+  const playersAfter = players.map((p) => (p.id === eliminatedId ? { ...p, isAlive: false } : p));
   const winner = calcWinner(playersAfter);
 
   if (winner) {
@@ -479,11 +574,12 @@ export async function resolveVote(roomId: string, nightDurationSec = 60) {
       "vote.resolvedAt": serverTimestamp(),
       "vote.eliminatedPlayerId": eliminatedId,
       "vote.resolved": true,
+      night: {},
     });
   } else {
     batch.update(roomRef, {
       phase: "night",
-      phaseEndsAtMs: computeEndsAtMs(nightDurationSec),
+      phaseEndsAtMs: computeEndsAtMs(nightSec),
       night: {},
       "vote.resolvedAt": serverTimestamp(),
       "vote.eliminatedPlayerId": eliminatedId,
@@ -492,4 +588,11 @@ export async function resolveVote(roomId: string, nightDurationSec = 60) {
   }
 
   await batch.commit();
+
+  await addEvent({
+    roomId,
+    type: "vote_resolved",
+    text: eliminatedId ? "Vote: 1 player eliminated" : "Vote: tie/no elimination",
+    phase: winner ? "ended" : "night",
+  });
 }
