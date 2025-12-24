@@ -115,7 +115,7 @@ export default function Room() {
   const alivePlayers = useMemo(() => players.filter((p) => p.isAlive), [players]);
 
   const myRole = me?.role as any;
-  const isMafiaRole = myRole === "mafia" || myRole === "don";
+  const isMafiaPlayer = myRole === "mafia" || myRole === "don";
   const isDoctor = myRole === "doctor";
   const isKomissar = myRole === "komissar";
 
@@ -242,7 +242,7 @@ export default function Room() {
     if (!targetId) return alert("Target tanlang");
 
     const roleToSend =
-      isMafiaRole ? (myRole === "don" ? "don" : "mafia") : isDoctor ? "doctor" : "komissar";
+      isMafiaPlayer ? (myRole === "don" ? "don" : "mafia") : isDoctor ? "doctor" : "komissar";
 
     try {
       await submitNightAction({
@@ -379,10 +379,10 @@ export default function Room() {
           <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
             <p className="font-semibold text-lg">🌙 Night Phase</p>
 
-            {(isMafiaRole || isDoctor || isKomissar) ? (
+            {(isMafiaPlayer || isDoctor || isKomissar) ? (
               <>
                 <p className="mt-3 text-sm text-slate-300">
-                  {isMafiaRole && "Kimni o‘ldirmoqchisiz?"}
+                  {isMafiaPlayer && "Kimni o‘ldirmoqchisiz?"}
                   {isDoctor && "Kimni saqlamoqchisiz?"}
                   {isKomissar && "Kimni tekshirmoqchisiz?"}
                 </p>
