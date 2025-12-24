@@ -32,7 +32,7 @@ export default function Room() {
   const [roomId, setRoomId] = useState<string | null>(null);
   const [room, setRoom] = useState<any>(null);
   const [players, setPlayers] = useState<any[]>([]);
-  const [ setLoading] = useState(true);
+  const [loading, setLoading] = useState(true);
 
   const [targetId, setTargetId] = useState<string>("");
   const [nowMs, setNowMs] = useState<number>(Date.now());
