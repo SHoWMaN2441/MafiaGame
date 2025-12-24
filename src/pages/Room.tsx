@@ -1,9 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import type { NavigateFunction } from "react-router-dom";
-const navigate: NavigateFunction = useNavigate();
-navigate("/");
-
 import {
   findRoomByCode,
   listenPlayers,
@@ -17,8 +13,7 @@ import {
   resolveVote,
   setPlayerConnection,
   heartbeat,
-  autoRejoinIfNeeded,
-  kickPlayer,
+  ensurePlayerExists,
 } from "../firebase/roomService";
 import { avatars } from "../data/avatars";
 
@@ -69,7 +64,7 @@ export default function Room() {
       const r = await findRoomByCode(code);
       if (!r) {
         alert("Room topilmadi");
-        navigate("/");
+        nav("/");
         return;
       }
 
@@ -93,19 +88,6 @@ export default function Room() {
     return players.find((p) => p.id === playerId) || null;
   }, [players, playerId]);
 
-  // ✅ kicked bo‘lsa chiqarib yuboramiz
-  useEffect(() => {
-    if (!me) return;
-    if (me.isKicked) {
-      alert("Siz host tomonidan kick qilindingiz.");
-      if (code) {
-        localStorage.removeItem(`playerId_${code}`);
-        localStorage.removeItem(`roomId_${code}`);
-      }
-      navigate("/");
-    }
-  }, [me, nav, code]);
-
   const isHost = useMemo(() => {
     if (!room || !playerId) return false;
     return room.ownerPlayerId === playerId;
@@ -119,7 +101,7 @@ export default function Room() {
   const alivePlayers = useMemo(() => players.filter((p) => p.isAlive), [players]);
 
   const myRole = me?.role as any;
-  const isMafiaPlayer = myRole === "mafia" || myRole === "don";
+  const isMafiaRole = myRole === "mafia" || myRole === "don";
   const isDoctor = myRole === "doctor";
   const isKomissar = myRole === "komissar";
 
@@ -134,36 +116,26 @@ export default function Room() {
     return Math.ceil((ends - nowMs) / 1000);
   }, [room, nowMs]);
 
-  // ✅ AUTO REJOIN: player doc yo‘q bo‘lsa qayta qo‘shadi
-  useEffect(() => {
-    if (!roomId || !code) return;
-
-    (async () => {
-      const res = await autoRejoinIfNeeded({
-        roomId,
-        code,
-        nicknameFallback: "Guest",
-        avatarFallback: "avatar_1",
-      });
-
-      // agar yangi player yaratgan bo‘lsa, UI yangilansin
-      if (res.didRejoin) {
-        // hech narsa shart emas — listenerlar update qiladi
-      }
-    })();
-  }, [roomId, code]);
-
-  // heartbeat + leave/offline
+  // -------- RECONNECT / ONLINE HEARTBEAT --------
   useEffect(() => {
     if (!roomId || !playerId) return;
 
-    setPlayerConnection(roomId, playerId, true).catch(() => {});
+    (async () => {
+      const ok = await ensurePlayerExists(roomId, playerId);
+      if (!ok) {
+        alert("Player topilmadi (localStorage o‘chgan bo‘lishi mumkin). Home’dan qayta kiring.");
+        nav("/");
+        return;
+      }
+      await setPlayerConnection(roomId, playerId, true);
+    })();
 
     const hb = setInterval(() => {
       heartbeat(roomId, playerId).catch(() => {});
     }, 5000);
 
     const onUnload = () => {
+      // beforeunload ichida await bo‘lmaydi — lekin ko‘pincha update ulguradi
       setPlayerConnection(roomId, playerId, false).catch(() => {});
     };
 
@@ -174,9 +146,9 @@ export default function Room() {
       window.removeEventListener("beforeunload", onUnload);
       setPlayerConnection(roomId, playerId, false).catch(() => {});
     };
-  }, [roomId, playerId]);
+  }, [roomId, playerId, nav]);
 
-  // host auto-advance (oldingi fix usul)
+  // -------- TIMER AUTO ADVANCE (host) FIX --------
   useEffect(() => {
     if (!isHost) return;
     if (!roomId) return;
@@ -187,11 +159,13 @@ export default function Room() {
       if (!room.phaseEndsAtMs) return;
 
       const key = `${room.phase}-${room.phaseEndsAtMs}`;
+      // phase o‘zgargan bo‘lsa lock yangilanadi (va qayta ishlash mumkin bo‘ladi)
       if (autoLockRef.current === `done-${key}`) return;
 
       const expired = Date.now() >= Number(room.phaseEndsAtMs);
       if (!expired) return;
 
+      // shu phase-end uchun bitta marta ishlatamiz
       autoLockRef.current = `done-${key}`;
 
       try {
@@ -207,6 +181,7 @@ export default function Room() {
         }
       } catch (e) {
         console.log("auto-advance error:", e);
+        // agar error bo‘lsa yana urinishi uchun lockni bo‘shatib qo‘yamiz
         autoLockRef.current = "";
       }
     };
@@ -219,9 +194,8 @@ export default function Room() {
   }, [isHost, roomId, room, DAY_SEC, VOTE_SEC, NIGHT_SEC]);
 
   async function setAvatar(a: string) {
-    if (!roomId || !playerId || !code) return;
+    if (!roomId || !playerId) return;
     await updatePlayer(roomId, playerId, { avatar: a });
-    localStorage.setItem(`avatar_${code}`, a);
   }
 
   async function toggleReady() {
@@ -246,7 +220,7 @@ export default function Room() {
     if (!targetId) return alert("Target tanlang");
 
     const roleToSend =
-      isMafiaPlayer ? (myRole === "don" ? "don" : "mafia") : isDoctor ? "doctor" : "komissar";
+      isMafiaRole ? (myRole === "don" ? "don" : "mafia") : isDoctor ? "doctor" : "komissar";
 
     try {
       await submitNightAction({
@@ -280,13 +254,7 @@ export default function Room() {
   async function onLeave() {
     if (!roomId || !playerId) return;
     await setPlayerConnection(roomId, playerId, false);
-    navigate("/");
-  }
-
-  async function onKick(targetPlayerId: string) {
-    if (!isHost || !roomId) return;
-    if (targetPlayerId === playerId) return alert("O‘zingizni kick qila olmaysiz");
-    await kickPlayer(roomId, targetPlayerId);
+    nav("/");
   }
 
   const killedName = useMemo(() => {
@@ -317,7 +285,7 @@ export default function Room() {
     );
   }, [isKomissar, room, players]);
 
-  // online indicator
+  // online indicator: isConnected true va lastSeenAtMs 12 sekund ichida bo‘lsa online
   const onlineSet = useMemo(() => {
     const s = new Set<string>();
     const now = Date.now();
@@ -333,7 +301,7 @@ export default function Room() {
     <div className="min-h-screen bg-slate-900 text-white p-4">
       <div className="max-w-3xl mx-auto">
         <div className="flex items-center justify-between">
-          <h2 className="text-2xl font-bold">Room</h2>
+          <h2 className="text-2xl font-bold">Room Lobby / Game</h2>
           <div className="flex gap-2">
             <button
               onClick={onLeave}
@@ -350,7 +318,7 @@ export default function Room() {
           </div>
         </div>
 
-        {/* TIMER */}
+        {/* TIMER BAR */}
         {room?.status === "playing" && room?.phase !== "ended" && timeLeftSec !== null && (
           <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4 flex items-center justify-between">
             <div>
@@ -367,26 +335,38 @@ export default function Room() {
           </div>
         )}
 
-        {/* DAY INFO */}
-        {room?.status === "playing" && room?.phase === "day" && (
-          <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
-            <p className="font-semibold text-lg">☀️ Day Phase</p>
-            <p className="text-sm text-slate-300 mt-2">
-              Kechasi o‘lgan o‘yinchi: <span className="font-bold">{killedName}</span>
+        {/* GAME / WINNER */}
+        {room?.status === "ended" && (
+          <div className="mt-4 bg-amber-900/40 border border-amber-700 rounded-2xl p-4">
+            <p className="font-semibold text-lg">🏁 Game Ended</p>
+            <p className="text-slate-200 mt-1">
+              Winner:{" "}
+              <span className="font-bold">
+                {room.winner === "mafia" ? "MAFIA 😈" : "TOWN 🙂"}
+              </span>
             </p>
-            {checkBox}
           </div>
         )}
 
-        {/* NIGHT ACTION */}
+        {room?.status === "playing" && (
+          <div className="mt-4 bg-purple-900/40 border border-purple-700 rounded-2xl p-4">
+            <p className="font-semibold">Game started 🎮</p>
+            <p className="text-sm text-slate-300">Phase: {room.phase}</p>
+            <p className="text-sm text-slate-300">
+              Sizning role: <span className="font-bold">{me?.role}</span>
+            </p>
+          </div>
+        )}
+
+        {/* NIGHT */}
         {room?.status === "playing" && room?.phase === "night" && (
           <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
             <p className="font-semibold text-lg">🌙 Night Phase</p>
 
-            {(isMafiaPlayer || isDoctor || isKomissar) ? (
+            {(isMafiaRole || isDoctor || isKomissar) ? (
               <>
                 <p className="mt-3 text-sm text-slate-300">
-                  {isMafiaPlayer && "Kimni o‘ldirmoqchisiz?"}
+                  {isMafiaRole && "Kimni o‘ldirmoqchisiz?"}
                   {isDoctor && "Kimni saqlamoqchisiz?"}
                   {isKomissar && "Kimni tekshirmoqchisiz?"}
                 </p>
@@ -429,6 +409,17 @@ export default function Room() {
           </div>
         )}
 
+        {/* DAY */}
+        {room?.status === "playing" && room?.phase === "day" && (
+          <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
+            <p className="font-semibold text-lg">☀️ Day Phase</p>
+            <p className="text-sm text-slate-300 mt-2">
+              Kechasi o‘lgan o‘yinchi: <span className="font-bold">{killedName}</span>
+            </p>
+            {checkBox}
+          </div>
+        )}
+
         {/* VOTE */}
         {room?.status === "playing" && room?.phase === "vote" && (
           <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
@@ -454,7 +445,12 @@ export default function Room() {
                             : "bg-slate-900 border-slate-700 hover:opacity-90")
                         }
                       >
-                        <p className="font-semibold">{p.nickname}</p>
+                        <p className="font-semibold flex items-center gap-2">
+                          {p.nickname}
+                          <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700">
+                            {onlineSet.has(p.id) ? "online" : "offline"}
+                          </span>
+                        </p>
                         <p className="text-xs opacity-70">{p.avatar}</p>
                       </button>
                     ))}
@@ -478,7 +474,7 @@ export default function Room() {
           </div>
         )}
 
-        {/* vote result */}
+        {/* Vote result */}
         {room?.status === "playing" && room?.vote?.resolved && room?.phase === "night" && (
           <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
             <p className="font-semibold">Vote Result</p>
@@ -488,89 +484,128 @@ export default function Room() {
           </div>
         )}
 
-        {/* PLAYERS LIST + HOST KICK */}
-        <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
-          <div className="flex items-center justify-between mb-3">
-            <p className="font-semibold">Players</p>
-            <span className="text-sm text-slate-300">{players.length} ta</span>
-          </div>
+        {/* LOBBY / PLAYERS */}
+        <div className="mt-4 grid gap-4 md:grid-cols-3">
+          <div className="md:col-span-1 bg-slate-800 border border-slate-700 rounded-2xl p-4">
+            <p className="text-slate-300 text-sm">Room Code</p>
+            <p className="text-3xl font-bold tracking-widest mt-1">{code}</p>
 
-          <div className="grid sm:grid-cols-2 gap-3">
-            {players.map((p) => (
-              <div
-                key={p.id}
-                className={
-                  "border rounded-2xl p-3 flex items-center justify-between " +
-                  (p.isAlive ? "bg-slate-900 border-slate-700" : "bg-rose-900/30 border-rose-700")
-                }
-              >
-                <div>
-                  <p className="font-semibold flex items-center gap-2">
-                    {p.nickname} {!p.isAlive ? "💀" : ""}
-                    <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700">
-                      {onlineSet.has(p.id) ? "online" : "offline"}
-                    </span>
-                    {p.isKicked && (
-                      <span className="text-xs px-2 py-0.5 rounded-full bg-rose-500 text-slate-900">
-                        kicked
-                      </span>
-                    )}
-                  </p>
-                  <p className="text-xs text-slate-400">{p.avatar}</p>
-                </div>
+            <button
+              onClick={() => navigator.clipboard.writeText(code || "")}
+              className="mt-3 w-full px-4 py-2 rounded-xl bg-white text-slate-900 font-semibold"
+            >
+              Copy
+            </button>
 
-                {isHost && p.id !== playerId && !p.isKicked && (
-                  <button
-                    onClick={() => onKick(p.id)}
-                    className="px-3 py-2 rounded-xl bg-rose-500 text-slate-900 font-semibold"
-                  >
-                    Kick
-                  </button>
-                )}
+            <div className="mt-4">
+              <p className="text-slate-300 text-sm mb-2">My status</p>
+              <div className="bg-slate-900 border border-slate-700 rounded-xl p-3">
+                <p className="text-sm">
+                  Nick: <span className="font-semibold">{me?.nickname || "?"}</span>
+                </p>
+                <p className="text-sm">
+                  Avatar: <span className="font-semibold">{me?.avatar || "?"}</span>
+                </p>
+                <p className="text-sm">
+                  Alive:{" "}
+                  <span className={me?.isAlive ? "text-emerald-400" : "text-rose-400"}>
+                    {me?.isAlive ? "YES" : "NO"}
+                  </span>
+                </p>
+                <p className="text-sm">
+                  Ready:{" "}
+                  <span className={me?.isReady ? "text-emerald-400" : "text-rose-400"}>
+                    {me?.isReady ? "YES" : "NO"}
+                  </span>
+                </p>
+                <p className="text-xs mt-2 text-slate-400">
+                  Siz: {isHost ? "HOST 👑" : "PLAYER"}
+                </p>
               </div>
-            ))}
-          </div>
 
-          {/* AVATAR */}
-          <div className="mt-6">
-            <p className="font-semibold mb-2">Choose avatar</p>
-            <div className="flex flex-wrap gap-2">
-              {avatars.map((a) => (
+              <button
+                onClick={toggleReady}
+                disabled={!me || room?.status === "playing" || room?.status === "ended"}
+                className="mt-3 w-full px-4 py-2 rounded-xl bg-emerald-500 text-slate-900 font-semibold disabled:opacity-50"
+              >
+                {me?.isReady ? "Unready" : "Ready"}
+              </button>
+
+              {isHost && (
                 <button
-                  key={a}
-                  onClick={() => setAvatar(a)}
-                  className={
-                    "px-3 py-2 rounded-xl border text-sm " +
-                    (me?.avatar === a
-                      ? "bg-white text-slate-900 border-white"
-                      : "bg-slate-900 border-slate-700 hover:opacity-90")
-                  }
+                  onClick={onStartGame}
+                  disabled={!allReady || room?.status === "playing" || room?.status === "ended"}
+                  className="mt-3 w-full px-4 py-2 rounded-xl bg-purple-500 text-slate-900 font-semibold disabled:opacity-50"
                 >
-                  {a}
+                  Start Game
                 </button>
-              ))}
+              )}
             </div>
           </div>
 
-          {/* READY + START */}
-          <div className="mt-4 flex gap-2">
-            <button
-              onClick={toggleReady}
-              disabled={!me || room?.status === "playing" || room?.status === "ended"}
-              className="w-full px-4 py-2 rounded-xl bg-emerald-500 text-slate-900 font-semibold disabled:opacity-50"
-            >
-              {me?.isReady ? "Unready" : "Ready"}
-            </button>
+          <div className="md:col-span-2 bg-slate-800 border border-slate-700 rounded-2xl p-4">
+            <div className="flex items-center justify-between mb-3">
+              <p className="font-semibold">Players</p>
+              <span className="text-sm text-slate-300">{players.length} ta</span>
+            </div>
 
-            {isHost && (
-              <button
-                onClick={onStartGame}
-                disabled={!allReady || room?.status === "playing" || room?.status === "ended"}
-                className="w-full px-4 py-2 rounded-xl bg-purple-500 text-slate-900 font-semibold disabled:opacity-50"
-              >
-                Start Game
-              </button>
+            {loading ? (
+              <p className="text-slate-300">Loading...</p>
+            ) : (
+              <div className="grid sm:grid-cols-2 gap-3">
+                {players.map((p) => (
+                  <div
+                    key={p.id}
+                    className={
+                      "border rounded-2xl p-3 flex items-center justify-between " +
+                      (p.isAlive ? "bg-slate-900 border-slate-700" : "bg-rose-900/30 border-rose-700")
+                    }
+                  >
+                    <div>
+                      <p className="font-semibold flex items-center gap-2">
+                        {p.nickname} {!p.isAlive ? "💀" : ""}
+                        <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700">
+                          {onlineSet.has(p.id) ? "online" : "offline"}
+                        </span>
+                      </p>
+                      <p className="text-xs text-slate-400">{p.avatar}</p>
+                    </div>
+                    <span
+                      className={
+                        "text-xs px-3 py-1 rounded-full " +
+                        (p.isReady ? "bg-emerald-500 text-slate-900" : "bg-slate-700 text-white")
+                      }
+                    >
+                      {p.isReady ? "READY" : "WAIT"}
+                    </span>
+                  </div>
+                ))}
+              </div>
             )}
+
+            <div className="mt-6">
+              <p className="font-semibold mb-2">Choose avatar</p>
+              <div className="flex flex-wrap gap-2">
+                {avatars.map((a) => (
+                  <button
+                    key={a}
+                    onClick={() => setAvatar(a)}
+                    disabled={room?.status === "playing" || room?.status === "ended"}
+                    className={
+                      "px-3 py-2 rounded-xl border text-sm disabled:opacity-50 " +
+                      (me?.avatar === a
+                        ? "bg-white text-slate-900 border-white"
+                        : "bg-slate-900 border-slate-700 hover:opacity-90")
+                    }
+                  >
+                    {a}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-slate-400 mt-2">
+                O‘yin boshlanganidan keyin avatar/ready o‘zgarmaydi (MVP).
+              </p>
+            </div>
           </div>
         </div>
       </div>
