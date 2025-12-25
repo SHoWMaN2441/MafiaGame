@@ -33,7 +33,6 @@ export default function GameModal({
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
         >
-          {/* overlay */}
           <motion.div
             className="absolute inset-0 bg-black/70"
             initial={{ opacity: 0 }}
@@ -42,7 +41,6 @@ export default function GameModal({
             onClick={onClose}
           />
 
-          {/* modal */}
           <motion.div
             className="relative w-full max-w-md rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl"
             initial={{ scale: 0.85, y: 20, opacity: 0 }}
@@ -59,7 +57,6 @@ export default function GameModal({
               </button>
             </div>
 
-            {/* small animated banner */}
             <motion.div
               className="mt-4 h-16 rounded-2xl border border-slate-700 bg-slate-800 relative overflow-hidden"
               initial={{ opacity: 0 }}

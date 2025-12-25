@@ -35,12 +35,10 @@ function calcWinner(players: any[]) {
   return null;
 }
 
-// ---------- TIMER HELPERS ----------
 export function computeEndsAtMs(durationSec: number) {
   return Date.now() + durationSec * 1000;
 }
 
-// ---------- EVENTS (LOG) ----------
 export async function addEvent(params: {
   roomId: string;
   type: string;
@@ -67,7 +65,6 @@ export function listenEvents(roomId: string, cb: (events: any[]) => void): Unsub
   });
 }
 
-// ---------- CHAT ----------
 export async function sendMessage(params: {
   roomId: string;
   senderId: string;
@@ -97,7 +94,6 @@ export function listenMessages(roomId: string, cb: (msgs: any[]) => void): Unsub
   });
 }
 
-// ---------- HOST SETTINGS ----------
 export async function updateRoomSettings(
   roomId: string,
   settings: Partial<{ nightSec: number; daySec: number; voteSec: number }>
@@ -115,7 +111,6 @@ export async function updateRoomSettings(
   });
 }
 
-// ---------- PLAYER CONNECTION ----------
 export async function setPlayerConnection(roomId: string, playerId: string, isConnected: boolean) {
   await updateDoc(doc(db, "rooms", roomId, "players", playerId), {
     isConnected,
@@ -138,7 +133,6 @@ export async function ensurePlayerExists(roomId: string, playerId: string) {
   return snap.exists();
 }
 
-// ✅ AUTO REJOIN (reconnect)
 export async function autoRejoinIfNeeded(params: {
   roomId: string;
   code: string;
@@ -179,7 +173,6 @@ export async function autoRejoinIfNeeded(params: {
   return { playerId: playerRef.id, didRejoin: true };
 }
 
-// ------- CREATE ROOM -------
 export async function createRoom(nickname: string) {
   const code = generateRoomCode();
 
@@ -234,7 +227,6 @@ export async function createRoom(nickname: string) {
   return { roomId: roomRef.id, code };
 }
 
-// ------- FIND ROOM BY CODE -------
 export async function findRoomByCode(code: string) {
   const q = query(collection(db, "rooms"), where("code", "==", code), limit(1));
   const snap = await getDocs(q);
@@ -245,7 +237,6 @@ export async function findRoomByCode(code: string) {
   return { roomId: d.id, ...(d.data() as any) };
 }
 
-// ------- JOIN ROOM -------
 export async function joinRoom(roomId: string, code: string, nickname: string) {
   const playerRef = await addDoc(collection(db, "rooms", roomId, "players"), {
     nickname,
@@ -274,7 +265,6 @@ export async function joinRoom(roomId: string, code: string, nickname: string) {
   });
 }
 
-// ------- REALTIME LISTENERS -------
 export function listenRoomById(roomId: string, cb: (room: any) => void): Unsubscribe {
   return onSnapshot(doc(db, "rooms", roomId), (snap) => {
     cb(snap.exists() ? { id: snap.id, ...snap.data() } : null);
@@ -289,7 +279,6 @@ export function listenPlayers(roomId: string, cb: (players: any[]) => void): Uns
   });
 }
 
-// ------- UPDATE PLAYER (READY/AVATAR) -------
 export async function updatePlayer(
   roomId: string,
   playerId: string,
@@ -298,7 +287,6 @@ export async function updatePlayer(
   await updateDoc(doc(db, "rooms", roomId, "players", playerId), data);
 }
 
-// ✅ Host kick
 export async function kickPlayer(roomId: string, targetPlayerId: string) {
   await updateDoc(doc(db, "rooms", roomId, "players", targetPlayerId), {
     isKicked: true,
@@ -314,7 +302,6 @@ export async function kickPlayer(roomId: string, targetPlayerId: string) {
   });
 }
 
-// ✅ Host remove
 export async function removePlayer(roomId: string, targetPlayerId: string) {
   await updateDoc(doc(db, "rooms", roomId, "players", targetPlayerId), {
     isConnected: false,
@@ -329,7 +316,6 @@ export async function removePlayer(roomId: string, targetPlayerId: string) {
   });
 }
 
-// ------- START GAME (ROLES + PHASE) -------
 function shuffle<T>(arr: T[]) {
   const a = [...arr];
   for (let i = a.length - 1; i > 0; i--) {
@@ -409,8 +395,6 @@ export async function startGame(roomId: string, nightDurationSec?: number) {
   });
 }
 
-// ------- NIGHT ACTIONS (SUBMIT) -------
-// ✅ 1 marta: player.nightSubmitted true bo‘lsa qayta yozmaymiz (MVP)
 export async function submitNightAction(params: {
   roomId: string;
   role: "mafia" | "don" | "doctor" | "komissar";
@@ -455,14 +439,12 @@ export async function submitNightAction(params: {
     });
   }
 
-  // lock
   await updateDoc(actorRef, {
     nightSubmitted: true,
     nightSubmittedAtMs: Date.now(),
   });
 }
 
-// ------- NIGHT RESOLVE (HOST) -------
 export async function resolveNight(roomId: string, dayDurationSec?: number) {
   const roomRef = doc(db, "rooms", roomId);
   const roomSnap = await getDoc(roomRef);
@@ -481,7 +463,6 @@ export async function resolveNight(roomId: string, dayDurationSec?: number) {
   const ps = await getDocs(q);
   const players = ps.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
 
-  // ✅ komissar natijasi faqat komissarga yoziladi
   if (checkTargetId && checkBy) {
     const target = players.find((p) => p.id === checkTargetId);
     if (target) {
@@ -506,7 +487,6 @@ export async function resolveNight(roomId: string, dayDurationSec?: number) {
     batch.update(doc(db, "rooms", roomId, "players", killedPlayerId), { isAlive: false });
   }
 
-  // ✅ nightSubmitted reset (next night uchun)
   players.forEach((p) => {
     batch.update(doc(db, "rooms", roomId, "players", p.id), { nightSubmitted: false });
   });
@@ -554,14 +534,12 @@ export async function resolveNight(roomId: string, dayDurationSec?: number) {
   });
 }
 
-// ------- VOTE: START (HOST) -------
 export async function startVote(roomId: string, voteDurationSec?: number) {
   const roomRef = doc(db, "rooms", roomId);
   const snap = await getDoc(roomRef);
   const room = snap.exists() ? (snap.data() as any) : null;
   const voteSec = voteDurationSec ?? room?.settings?.voteSec ?? 45;
 
-  // voteSubmitted reset (vote boshida)
   const ps = await getDocs(query(collection(db, "rooms", roomId, "players"), orderBy("createdAt", "asc")));
   const batch = writeBatch(db);
   ps.docs.forEach((d) => {
@@ -588,7 +566,6 @@ export async function startVote(roomId: string, voteDurationSec?: number) {
   });
 }
 
-// ------- VOTE: SUBMIT (1 marta) -------
 export async function submitVote(params: {
   roomId: string;
   voterPlayerId: string;
@@ -614,7 +591,6 @@ export async function submitVote(params: {
   });
 }
 
-// ------- VOTE: RESOLVE (HOST) -------
 export async function resolveVote(roomId: string, nightDurationSec?: number) {
   const roomRef = doc(db, "rooms", roomId);
   const roomSnap = await getDoc(roomRef);
@@ -660,7 +636,6 @@ export async function resolveVote(roomId: string, nightDurationSec?: number) {
     batch.update(doc(db, "rooms", roomId, "players", eliminatedId), { isAlive: false });
   }
 
-  // voteSubmitted reset (keyingi vote uchun)
   players.forEach((p) => {
     batch.update(doc(db, "rooms", roomId, "players", p.id), { voteSubmitted: false });
   });
