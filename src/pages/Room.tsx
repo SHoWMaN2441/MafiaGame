@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
+import toast from "react-hot-toast";
+import { AnimatePresence, motion } from "framer-motion";
+
 import {
   findRoomByCode,
   listenPlayers,
@@ -19,7 +22,9 @@ import {
   listenEvents,
   updateRoomSettings,
 } from "../firebase/roomService";
-import { avatars } from "../data/avatars";
+
+import { avatars, avatarSrc } from "../data/avatars";
+import { roleAssets } from "../data/roles";
 
 function formatSec(sec: number) {
   const s = Math.max(0, sec);
@@ -30,6 +35,94 @@ function formatSec(sec: number) {
 
 function isMafiaRole(role: string) {
   return role === "mafia" || role === "don";
+}
+
+/** lightweight modal (built-in) */
+function ResultModal({
+  open,
+  type,
+  title,
+  subtitle,
+  onClose,
+}: {
+  open: boolean;
+  type: "win" | "lose" | "info";
+  title: string;
+  subtitle?: string;
+  onClose: () => void;
+}) {
+  const badge =
+    type === "win"
+      ? "bg-emerald-500 text-slate-900"
+      : type === "lose"
+      ? "bg-rose-500 text-slate-900"
+      : "bg-white text-slate-900";
+
+  return (
+    <AnimatePresence>
+      {open && (
+        <motion.div
+          className="fixed inset-0 z-[100] flex items-center justify-center p-4"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+        >
+          <motion.div
+            className="absolute inset-0 bg-black/70"
+            onClick={onClose}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          />
+
+          <motion.div
+            className="relative w-full max-w-md rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl"
+            initial={{ scale: 0.85, y: 20, opacity: 0 }}
+            animate={{ scale: 1, y: 0, opacity: 1 }}
+            exit={{ scale: 0.9, y: 10, opacity: 0 }}
+            transition={{ type: "spring", stiffness: 260, damping: 20 }}
+          >
+            <div className="flex items-center justify-between">
+              <span className={`text-xs px-3 py-1 rounded-full font-semibold ${badge}`}>
+                {type.toUpperCase()}
+              </span>
+              <button onClick={onClose} className="text-slate-300 hover:text-white text-sm">
+                ✕
+              </button>
+            </div>
+
+            {/* animated banner */}
+            <motion.div
+              className="mt-4 h-16 rounded-2xl border border-slate-700 bg-slate-800 relative overflow-hidden"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+            >
+              <motion.div
+                className="absolute -left-10 top-4 h-8 w-28 rounded-full bg-white/10"
+                animate={{ x: [0, 520] }}
+                transition={{ duration: 2.5, repeat: Infinity }}
+              />
+              <motion.div
+                className="absolute -left-20 top-8 h-6 w-20 rounded-full bg-white/10"
+                animate={{ x: [0, 520] }}
+                transition={{ duration: 3.2, repeat: Infinity }}
+              />
+            </motion.div>
+
+            <h3 className="mt-4 text-2xl font-bold">{title}</h3>
+            {subtitle && <p className="mt-2 text-slate-300">{subtitle}</p>}
+
+            <button
+              onClick={onClose}
+              className="mt-6 w-full rounded-2xl bg-white text-slate-900 font-semibold py-3 hover:opacity-95"
+            >
+              Back to Home
+            </button>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
 }
 
 export default function Room() {
@@ -55,12 +148,21 @@ export default function Room() {
   const [chatText, setChatText] = useState("");
   const [chatScope, setChatScope] = useState<"lobby" | "public" | "mafia">("lobby");
 
+  // winner modal
+  const [resultModal, setResultModal] = useState<{
+    open: boolean;
+    type: "win" | "lose" | "info";
+    title: string;
+    subtitle?: string;
+  }>({ open: false, type: "info", title: "" });
+
   // durations used by host auto-advance (read from room.settings if exists)
   const NIGHT_SEC = room?.settings?.nightSec ?? 60;
   const DAY_SEC = room?.settings?.daySec ?? 60;
   const VOTE_SEC = room?.settings?.voteSec ?? 45;
 
   const autoLockRef = useRef<string>("");
+  const winnerLockRef = useRef<string>(""); // prevent modal spam
 
   const playerId = useMemo(() => {
     if (!code) return null;
@@ -83,7 +185,7 @@ export default function Room() {
       setLoading(true);
       const r = await findRoomByCode(code);
       if (!r) {
-        alert("Room topilmadi");
+        toast.error("Room topilmadi");
         nav("/");
         return;
       }
@@ -93,12 +195,12 @@ export default function Room() {
       unsubRoom = listenRoomById(r.roomId, (data) => {
         setRoom(data);
 
-        // settings input init (1 marta)
+        // settings input init (safe)
         const s = data?.settings;
         if (s) {
-          setNightSecInput(Number(s.nightSec ?? 60));
-          setDaySecInput(Number(s.daySec ?? 60));
-          setVoteSecInput(Number(s.voteSec ?? 45));
+          setNightSecInput((prev) => prev || Number(s.nightSec ?? 60));
+          setDaySecInput((prev) => prev || Number(s.daySec ?? 60));
+          setVoteSecInput((prev) => prev || Number(s.voteSec ?? 45));
         }
       });
 
@@ -149,6 +251,8 @@ export default function Room() {
   const isDoctor = myRole === "doctor";
   const isKomissar = myRole === "komissar";
 
+  const myRoleAsset = roleAssets[myRole] || roleAssets.unknown;
+
   const myVoteTarget = useMemo(() => {
     if (!me?.id) return null;
     return room?.vote?.votes?.[me.id] || null;
@@ -167,7 +271,7 @@ export default function Room() {
     (async () => {
       const ok = await ensurePlayerExists(roomId, playerId);
       if (!ok) {
-        alert("Player topilmadi. Home’dan qayta kiring.");
+        toast.error("Player topilmadi. Home’dan qayta kiring.");
         nav("/");
         return;
       }
@@ -233,32 +337,62 @@ export default function Room() {
     return () => clearInterval(i);
   }, [isHost, roomId, room, DAY_SEC, VOTE_SEC, NIGHT_SEC]);
 
-  async function setAvatar(a: string) {
+  // -------- SHOW WIN/LOSE MODAL (one time) --------
+  useEffect(() => {
+    if (!room) return;
+    if (room.status !== "ended") return;
+
+    const key = `${room.winner}-${room.endedAt || room.phaseEndsAtMs || "x"}`;
+    if (winnerLockRef.current === key) return;
+    winnerLockRef.current = key;
+
+    const winner = room.winner; // "mafia" | "town"
+    const winText = winner === "mafia" ? "MAFIA 😈" : "TOWN 🙂";
+
+    const iWin =
+      (winner === "mafia" && (me?.role === "mafia" || me?.role === "don")) ||
+      (winner === "town" && !(me?.role === "mafia" || me?.role === "don"));
+
+    setResultModal({
+      open: true,
+      type: iWin ? "win" : "lose",
+      title: iWin ? "You won! 🎉" : "You lost 😭",
+      subtitle: `Winner: ${winText}`,
+    });
+
+    toast(iWin ? "GG! You won 🎉" : "GG! Next time 😄", { icon: iWin ? "🏆" : "💀" });
+  }, [room?.status, room?.winner, me?.role]);
+
+  async function setAvatar(aId: string) {
     if (!roomId || !playerId) return;
-    await updatePlayer(roomId, playerId, { avatar: a });
+    await updatePlayer(roomId, playerId, { avatar: aId });
+    if (code) localStorage.setItem(`avatar_${code}`, aId);
+    toast.success("Avatar updated ✅");
   }
 
   async function toggleReady() {
     if (!roomId || !playerId || !me) return;
     await updatePlayer(roomId, playerId, { isReady: !me.isReady });
+    toast.success(!me.isReady ? "Ready ✅" : "Unready");
   }
 
   async function onStartGame() {
     if (!roomId) return;
-    if (!allReady) return alert("Hamma READY bo‘lsin");
+    if (!allReady) return toast.error("Hamma READY bo‘lsin");
     try {
       await startGame(roomId); // settings.nightSec ishlaydi
       setTargetId("");
       autoLockRef.current = "";
+      toast.success("Game started 🎮");
     } catch (e: any) {
-      alert(e?.message || "Start error");
+      toast.error(e?.message || "Start error");
     }
   }
 
   async function onSubmitNight() {
     if (!roomId || !me?.id) return;
-    if (!targetId) return alert("Target tanlang");
-    if (me?.nightSubmitted) return alert("Siz actionni yuborgan siz ✅");
+    if (!targetId) return toast.error("Target tanlang");
+    if (me?.nightSubmitted) return toast("Siz actionni yuborgan siz ✅", { icon: "✅" });
 
     const roleToSend =
       isMafiaPlayer ? (myRole === "don" ? "don" : "mafia") : isDoctor ? "doctor" : "komissar";
@@ -270,16 +404,16 @@ export default function Room() {
         actorPlayerId: me.id,
         targetPlayerId: targetId,
       });
-      alert("Action submitted ✅");
+      toast.success("Action submitted ✅");
     } catch (e: any) {
-      alert(e?.message || "Submit error");
+      toast.error(e?.message || "Submit error");
     }
   }
 
   async function onSubmitVote() {
     if (!roomId || !me?.id) return;
-    if (!targetId) return alert("Kimga ovoz berishni tanlang");
-    if (me?.voteSubmitted) return alert("Siz ovoz berib bo‘lgansiz ✅");
+    if (!targetId) return toast.error("Kimga ovoz berishni tanlang");
+    if (me?.voteSubmitted) return toast("Siz ovoz berib bo‘lgansiz ✅", { icon: "✅" });
 
     try {
       await submitVote({
@@ -287,15 +421,16 @@ export default function Room() {
         voterPlayerId: me.id,
         targetPlayerId: targetId,
       });
-      alert("Vote submitted ✅");
+      toast.success("Vote submitted ✅");
     } catch (e: any) {
-      alert(e?.message || "Vote error");
+      toast.error(e?.message || "Vote error");
     }
   }
 
   async function onLeave() {
     if (!roomId || !playerId) return;
     await setPlayerConnection(roomId, playerId, false);
+    toast("Left room", { icon: "👋" });
     nav("/");
   }
 
@@ -353,20 +488,23 @@ export default function Room() {
 
   async function onSendChat() {
     if (!roomId || !me?.id) return;
-    const scopeToSend =
-      chatScope === "mafia" && !isMafiaPlayer ? "public" : chatScope;
+    const text = chatText.trim();
+    if (!text) return;
+
+    const scopeToSend = chatScope === "mafia" && !isMafiaPlayer ? "public" : chatScope;
 
     try {
       await sendMessage({
         roomId,
         senderId: me.id,
         senderNick: me.nickname || "Player",
-        text: chatText,
+        text,
         scope: scopeToSend,
       });
       setChatText("");
+      // auto scroll toast optional
     } catch (e: any) {
-      alert(e?.message || "Chat error");
+      toast.error(e?.message || "Chat error");
     }
   }
 
@@ -379,9 +517,9 @@ export default function Room() {
 
     try {
       await updateRoomSettings(roomId, { nightSec: n, daySec: d, voteSec: v });
-      alert("Saved ✅");
+      toast.success("Saved ✅");
     } catch (e: any) {
-      alert(e?.message || "Save error");
+      toast.error(e?.message || "Save error");
     }
   }
 
@@ -406,6 +544,18 @@ export default function Room() {
           </div>
         </div>
 
+        {/* RESULT MODAL */}
+        <ResultModal
+          open={resultModal.open}
+          type={resultModal.type}
+          title={resultModal.title}
+          subtitle={resultModal.subtitle}
+          onClose={() => {
+            setResultModal((p) => ({ ...p, open: false }));
+            nav("/");
+          }}
+        />
+
         {/* TOP GRID */}
         <div className="mt-4 grid gap-4 lg:grid-cols-3">
           {/* LEFT: ROOM / ME / SETTINGS */}
@@ -414,7 +564,10 @@ export default function Room() {
             <p className="text-3xl font-bold tracking-widest mt-1">{code}</p>
 
             <button
-              onClick={() => navigator.clipboard.writeText(code || "")}
+              onClick={() => {
+                navigator.clipboard.writeText(code || "");
+                toast.success("Copied ✅");
+              }}
               className="mt-3 w-full px-4 py-2 rounded-xl bg-white text-slate-900 font-semibold"
             >
               Copy
@@ -423,36 +576,52 @@ export default function Room() {
             <div className="mt-4">
               <p className="text-slate-300 text-sm mb-2">My status</p>
               <div className="bg-slate-900 border border-slate-700 rounded-xl p-3">
-                <p className="text-sm">
-                  Nick: <span className="font-semibold">{me?.nickname || "?"}</span>
-                </p>
-                <p className="text-sm">
-                  Avatar: <span className="font-semibold">{me?.avatar || "?"}</span>
-                </p>
-                <p className="text-sm">
-                  Alive:{" "}
-                  <span className={me?.isAlive ? "text-emerald-400" : "text-rose-400"}>
-                    {me?.isAlive ? "YES" : "NO"}
-                  </span>
-                </p>
-                <p className="text-sm">
-                  Ready:{" "}
-                  <span className={me?.isReady ? "text-emerald-400" : "text-rose-400"}>
-                    {me?.isReady ? "YES" : "NO"}
-                  </span>
-                </p>
-                <p className="text-sm">
-                  Night:{" "}
-                  <span className={me?.nightSubmitted ? "text-emerald-400" : "text-slate-300"}>
-                    {me?.nightSubmitted ? "submitted ✅" : "not yet"}
-                  </span>
-                </p>
-                <p className="text-sm">
-                  Vote:{" "}
-                  <span className={me?.voteSubmitted ? "text-emerald-400" : "text-slate-300"}>
-                    {me?.voteSubmitted ? "submitted ✅" : "not yet"}
-                  </span>
-                </p>
+                <div className="flex items-center gap-3">
+                  <img
+                    src={avatarSrc(me?.avatar)}
+                    className="w-12 h-12 rounded-2xl border border-slate-700 bg-slate-800"
+                    alt="me"
+                  />
+                  <div>
+                    <p className="text-sm">
+                      Nick: <span className="font-semibold">{me?.nickname || "?"}</span>
+                    </p>
+                    <div className="flex items-center gap-2 mt-1">
+                      <img src={myRoleAsset.src} className="w-5 h-5" alt="role" />
+                      <p className="text-sm">
+                        Role: <span className="font-semibold">{myRoleAsset.label}</span>
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-2 grid grid-cols-2 gap-2 text-sm">
+                  <p>
+                    Alive:{" "}
+                    <span className={me?.isAlive ? "text-emerald-400" : "text-rose-400"}>
+                      {me?.isAlive ? "YES" : "NO"}
+                    </span>
+                  </p>
+                  <p>
+                    Ready:{" "}
+                    <span className={me?.isReady ? "text-emerald-400" : "text-rose-400"}>
+                      {me?.isReady ? "YES" : "NO"}
+                    </span>
+                  </p>
+                  <p>
+                    Night:{" "}
+                    <span className={me?.nightSubmitted ? "text-emerald-400" : "text-slate-300"}>
+                      {me?.nightSubmitted ? "submitted ✅" : "not yet"}
+                    </span>
+                  </p>
+                  <p>
+                    Vote:{" "}
+                    <span className={me?.voteSubmitted ? "text-emerald-400" : "text-slate-300"}>
+                      {me?.voteSubmitted ? "submitted ✅" : "not yet"}
+                    </span>
+                  </p>
+                </div>
+
                 <p className="text-xs mt-2 text-slate-400">Siz: {isHost ? "HOST 👑" : "PLAYER"}</p>
               </div>
 
@@ -479,9 +648,7 @@ export default function Room() {
             {isHost && (
               <div className="mt-5 bg-slate-900 border border-slate-700 rounded-2xl p-3">
                 <p className="font-semibold">Host Settings</p>
-                <p className="text-xs text-slate-400 mt-1">
-                  10–300 sec (o‘yinda keyingi timerlar shu bilan ishlaydi)
-                </p>
+                <p className="text-xs text-slate-400 mt-1">10–300 sec</p>
 
                 <div className="mt-3 grid grid-cols-3 gap-2">
                   <div>
@@ -544,7 +711,9 @@ export default function Room() {
                 <div className="text-right">
                   <p className="text-sm text-slate-300">Time left</p>
                   <p className="font-bold text-2xl">{formatSec(timeLeftSec)}</p>
-                  <p className="text-xs text-slate-400">Timer: {isHost ? "HOST ✅" : "Host boshqaradi"}</p>
+                  <p className="text-xs text-slate-400">
+                    Timer: {isHost ? "HOST ✅" : "Host boshqaradi"}
+                  </p>
                 </div>
               </div>
             )}
@@ -555,7 +724,9 @@ export default function Room() {
                 <p className="font-semibold text-lg">🏁 Game Ended</p>
                 <p className="text-slate-200 mt-1">
                   Winner:{" "}
-                  <span className="font-bold">{room.winner === "mafia" ? "MAFIA 😈" : "TOWN 🙂"}</span>
+                  <span className="font-bold">
+                    {room.winner === "mafia" ? "MAFIA 😈" : "TOWN 🙂"}
+                  </span>
                 </p>
               </div>
             )}
@@ -564,9 +735,12 @@ export default function Room() {
               <div className="mt-4 bg-purple-900/40 border border-purple-700 rounded-2xl p-4">
                 <p className="font-semibold">Game started 🎮</p>
                 <p className="text-sm text-slate-300">Phase: {room.phase}</p>
-                <p className="text-sm text-slate-300">
-                  Sizning role: <span className="font-bold">{me?.role}</span>
-                </p>
+                <div className="mt-2 flex items-center gap-2">
+                  <img src={myRoleAsset.src} className="w-6 h-6" alt="role" />
+                  <p className="text-sm text-slate-300">
+                    Sizning role: <span className="font-bold">{myRoleAsset.label}</span>
+                  </p>
+                </div>
               </div>
             )}
 
@@ -575,7 +749,7 @@ export default function Room() {
               <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
                 <p className="font-semibold text-lg">🌙 Night Phase</p>
 
-                {(isMafiaPlayer || isDoctor || isKomissar) ? (
+                {isMafiaPlayer || isDoctor || isKomissar ? (
                   <>
                     <p className="mt-3 text-sm text-slate-300">
                       {isMafiaPlayer && "Kimni o‘ldirmoqchisiz?"}
@@ -591,26 +765,32 @@ export default function Room() {
                             key={p.id}
                             onClick={() => setTargetId(p.id)}
                             className={
-                              "p-3 rounded-2xl border text-left " +
+                              "p-3 rounded-2xl border text-left flex items-center gap-3 " +
                               (targetId === p.id
                                 ? "bg-white text-slate-900 border-white"
                                 : "bg-slate-900 border-slate-700 hover:opacity-90")
                             }
                           >
-                            <p className="font-semibold flex items-center gap-2">
-                              {p.nickname}
-                              <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700">
-                                {onlineSet.has(p.id) ? "online" : "offline"}
-                              </span>
-
-                              {/* mafia/don sees teammates */}
-                              {isMafiaPlayer && isMafiaRole(p.role) && p.id !== me?.id && (
-                                <span className="text-xs px-2 py-0.5 rounded-full bg-red-500 text-slate-900">
-                                  teammate
+                            <img
+                              src={avatarSrc(p.avatar)}
+                              className="w-10 h-10 rounded-2xl border border-slate-700 bg-slate-800"
+                              alt="avatar"
+                            />
+                            <div>
+                              <p className="font-semibold flex items-center gap-2">
+                                {p.nickname}
+                                <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700 text-white">
+                                  {onlineSet.has(p.id) ? "online" : "offline"}
                                 </span>
-                              )}
-                            </p>
-                            <p className="text-xs opacity-70">{p.avatar}</p>
+
+                                {isMafiaPlayer && isMafiaRole(p.role) && p.id !== me?.id && (
+                                  <span className="text-xs px-2 py-0.5 rounded-full bg-red-500 text-slate-900">
+                                    teammate
+                                  </span>
+                                )}
+                              </p>
+                              <p className="text-xs opacity-70">{p.avatar}</p>
+                            </div>
                           </button>
                         ))}
                     </div>
@@ -659,19 +839,26 @@ export default function Room() {
                             key={p.id}
                             onClick={() => setTargetId(p.id)}
                             className={
-                              "p-3 rounded-2xl border text-left " +
+                              "p-3 rounded-2xl border text-left flex items-center gap-3 " +
                               (targetId === p.id
                                 ? "bg-white text-slate-900 border-white"
                                 : "bg-slate-900 border-slate-700 hover:opacity-90")
                             }
                           >
-                            <p className="font-semibold flex items-center gap-2">
-                              {p.nickname}
-                              <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700">
-                                {onlineSet.has(p.id) ? "online" : "offline"}
-                              </span>
-                            </p>
-                            <p className="text-xs opacity-70">{p.avatar}</p>
+                            <img
+                              src={avatarSrc(p.avatar)}
+                              className="w-10 h-10 rounded-2xl border border-slate-700 bg-slate-800"
+                              alt="avatar"
+                            />
+                            <div>
+                              <p className="font-semibold flex items-center gap-2">
+                                {p.nickname}
+                                <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700 text-white">
+                                  {onlineSet.has(p.id) ? "online" : "offline"}
+                                </span>
+                              </p>
+                              <p className="text-xs opacity-70">{p.avatar}</p>
+                            </div>
                           </button>
                         ))}
                     </div>
@@ -691,7 +878,6 @@ export default function Room() {
                           ? players.find((p) => p.id === myVoteTarget)?.nickname || "Unknown"
                           : "yo‘q"}
                       </span>
-                      {"  "} (UI secret emas, lekin MVP uchun qoldirildi)
                     </p>
                   </>
                 )}
@@ -708,26 +894,28 @@ export default function Room() {
               </div>
             )}
 
-            {/* AVATAR */}
+            {/* AVATAR PICKER */}
             <div className="mt-4 bg-slate-800 border border-slate-700 rounded-2xl p-4">
               <p className="font-semibold mb-2">Choose avatar</p>
               <div className="flex flex-wrap gap-2">
                 {avatars.map((a) => (
                   <button
-                    key={a}
-                    onClick={() => setAvatar(a)}
+                    key={a.id}
+                    onClick={() => setAvatar(a.id)}
                     disabled={room?.status === "playing" || room?.status === "ended"}
                     className={
-                      "px-3 py-2 rounded-xl border text-sm disabled:opacity-50 " +
-                      (me?.avatar === a
+                      "p-2 rounded-2xl border disabled:opacity-50 " +
+                      (me?.avatar === a.id
                         ? "bg-white text-slate-900 border-white"
                         : "bg-slate-900 border-slate-700 hover:opacity-90")
                     }
+                    title={a.id}
                   >
-                    {a}
+                    <img src={a.src} className="w-10 h-10 rounded-xl" alt={a.id} />
                   </button>
                 ))}
               </div>
+
               <p className="text-xs text-slate-400 mt-2">
                 O‘yin boshlanganidan keyin avatar/ready o‘zgarmaydi (MVP).
               </p>
@@ -756,21 +944,27 @@ export default function Room() {
                       (p.isAlive ? "bg-slate-900 border-slate-700" : "bg-rose-900/30 border-rose-700")
                     }
                   >
-                    <div>
-                      <p className="font-semibold flex items-center gap-2">
-                        {p.nickname} {!p.isAlive ? "💀" : ""}
-                        <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700">
-                          {onlineSet.has(p.id) ? "online" : "offline"}
-                        </span>
-
-                        {/* mafia teammates only */}
-                        {isMafiaPlayer && isMafiaRole(p.role) && p.id !== me?.id && (
-                          <span className="text-xs px-2 py-0.5 rounded-full bg-red-500 text-slate-900">
-                            teammate
+                    <div className="flex items-center gap-3">
+                      <img
+                        src={avatarSrc(p.avatar)}
+                        className="w-10 h-10 rounded-2xl border border-slate-700 bg-slate-800"
+                        alt="avatar"
+                      />
+                      <div>
+                        <p className="font-semibold flex items-center gap-2">
+                          {p.nickname} {!p.isAlive ? "💀" : ""}
+                          <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700">
+                            {onlineSet.has(p.id) ? "online" : "offline"}
                           </span>
-                        )}
-                      </p>
-                      <p className="text-xs text-slate-400">{p.avatar}</p>
+
+                          {isMafiaPlayer && isMafiaRole(p.role) && p.id !== me?.id && (
+                            <span className="text-xs px-2 py-0.5 rounded-full bg-red-500 text-slate-900">
+                              teammate
+                            </span>
+                          )}
+                        </p>
+                        <p className="text-xs text-slate-400">{p.avatar}</p>
+                      </div>
                     </div>
 
                     <span
@@ -807,6 +1001,9 @@ export default function Room() {
               <input
                 value={chatText}
                 onChange={(e) => setChatText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") onSendChat();
+                }}
                 placeholder="Message..."
                 className="flex-1 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-sm"
               />
